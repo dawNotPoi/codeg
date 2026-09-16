@@ -237,6 +237,12 @@ function ForgeSettingsScope({
               default_issue_scenario: issueScenario,
               default_pr_scenario: prScenario,
               writeback_default: writeback,
+              // This dialog does not edit the remote. Carrying the stored value
+              // through is what keeps a settings save from clearing a choice
+              // made with the panel's picker.
+              remote:
+                effectiveForgeSettings(store, isGlobal ? null : scope)
+                  ?.remote ?? null,
               // Blank entries are dropped here as well as server-side: the
               // object that comes back is what the page will hand the next
               // trigger dialog, and it should not carry keys that mean nothing.

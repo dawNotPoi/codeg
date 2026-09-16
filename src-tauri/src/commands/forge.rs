@@ -25,11 +25,17 @@ use crate::web::event_bridge::{emit_event, EventEmitter, WorkTaskChange, WORK_TA
 
 /// Hard cap for one reverse-lookup batch (a screen shows ~30 rows).
 const LOOKUP_KEYS_CAP: usize = 100;
+/// The remote the panel reads when a folder has no saved selection. The
+/// historical default, named once so both the resolution and its docs agree.
+const DEFAULT_FORGE_REMOTE: &str = "origin";
 /// Task card titles inherit the automation convention: 80 chars.
 const TITLE_CAP: usize = 80;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ForgeRemote {
+    /// Which remote this was resolved from — echoed back so the panel can show
+    /// the active choice instead of inferring it from the URL.
+    pub remote_name: String,
     pub server_host: String,
     pub owner_repo: String,
     pub remote_url: String,
@@ -409,15 +415,26 @@ pub struct ForgeTaskLink {
 
 // ── shared business logic (both modes) ──────────────────────────────────────
 
-/// The folder's `origin` remote, parsed into forge coordinates. `None` when
-/// there is no origin or its URL is not a recognizable forge repo.
+/// The folder's selected remote — the panel's saved choice, or `origin` when it
+/// has none — parsed into forge coordinates. `None` when the folder has no such
+/// remote or its URL is not a recognizable forge repo.
 pub async fn folder_forge_remote_core(
     db: &AppDatabase,
     folder_id: i32,
 ) -> Result<Option<ForgeRemote>, AppCommandError> {
     let folder = get_folder_core(db, folder_id).await?;
+    // Resolving the selection HERE is what makes every forge operation follow
+    // it: `resolve_folder_repo` calls this, so lists, comments, merges and task
+    // creation all read the repository the panel is showing.
+    let settings = forge::settings::load_effective(&db.conn, folder_id)
+        .await
+        .map_err(AppCommandError::db)?;
+    let remote_name = settings
+        .remote
+        .as_deref()
+        .unwrap_or(DEFAULT_FORGE_REMOTE);
     let output = crate::process::tokio_command("git")
-        .args(["-C", &folder.path, "remote", "get-url", "origin"])
+        .args(["-C", &folder.path, "remote", "get-url", remote_name])
         .output()
         .await
         .map_err(|e| AppCommandError::io_error("failed to run git").with_detail(e.to_string()))?;
@@ -430,6 +447,7 @@ pub async fn folder_forge_remote_core(
     };
     let profile = forge::host_profile(&db.conn, &server_host).await;
     Ok(Some(ForgeRemote {
+        remote_name: remote_name.to_string(),
         server_host,
         // A GitLab mounted under a relative URL root puts that mount path in
         // front of every repository path a git remote carries, while no API
@@ -473,7 +491,7 @@ async fn resolve_folder_repo(
         .await?
         .ok_or_else(|| {
             AppCommandError::configuration_missing(
-                "this folder has no recognizable forge remote (origin)",
+                "this folder has no recognizable forge remote",
             )
         })?;
     let auth =
@@ -1244,6 +1262,91 @@ fn _assert_forge_error_converts(err: ForgeError) -> AppCommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal git fixture: a repo with remotes and no commits needed.
+    fn git_run(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The panel follows the folder's SAVED remote selection rather than a
+    /// hardcoded `origin` — the fork workflow (`origin` = your fork, `upstream`
+    /// = the parent) is the point of the switch. With nothing saved the read is
+    /// byte-for-byte the old behavior, which is what keeps existing installs
+    /// unchanged.
+    #[tokio::test]
+    async fn folder_forge_remote_follows_the_saved_selection() {
+        use crate::db::service::folder_service;
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_run(dir.path(), &["init", "-q"]);
+        git_run(dir.path(), &["remote", "add", "origin", "https://github.com/me/app.git"]);
+        git_run(dir.path(), &["remote", "add", "upstream", "https://github.com/acme/app.git"]);
+        let folder = folder_service::add_folder(&db.conn, dir.path().to_str().unwrap())
+            .await
+            .expect("folder row");
+
+        // Nothing saved → the historical default.
+        let remote = folder_forge_remote_core(&db, folder.id)
+            .await
+            .expect("resolve")
+            .expect("origin resolves");
+        assert_eq!(remote.remote_name, "origin");
+        assert_eq!(remote.owner_repo, "me/app");
+
+        // A folder-scoped save must change what the very next read resolves.
+        let settings = crate::forge::settings::ForgePanelSettings {
+            remote: Some("upstream".into()),
+            ..Default::default()
+        };
+        crate::forge::settings::save(&db.conn, Some(folder.id), Some(settings))
+            .await
+            .expect("save");
+
+        let remote = folder_forge_remote_core(&db, folder.id)
+            .await
+            .expect("resolve")
+            .expect("upstream resolves");
+        assert_eq!(remote.remote_name, "upstream");
+        assert_eq!(remote.owner_repo, "acme/app");
+    }
+
+    /// A selection naming a remote the folder does not have is `None`, the same
+    /// answer a missing `origin` gives. The panel explains it instead of
+    /// spending a request on the wrong repository.
+    #[tokio::test]
+    async fn a_missing_selected_remote_resolves_to_none() {
+        use crate::db::service::folder_service;
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_run(dir.path(), &["init", "-q"]);
+        git_run(dir.path(), &["remote", "add", "origin", "https://github.com/me/app.git"]);
+        let folder = folder_service::add_folder(&db.conn, dir.path().to_str().unwrap())
+            .await
+            .expect("folder row");
+
+        let settings = crate::forge::settings::ForgePanelSettings {
+            remote: Some("upstream".into()),
+            ..Default::default()
+        };
+        crate::forge::settings::save(&db.conn, Some(folder.id), Some(settings))
+            .await
+            .expect("save");
+
+        assert!(
+            folder_forge_remote_core(&db, folder.id)
+                .await
+                .expect("resolve")
+                .is_none(),
+            "a missing selected remote must not fall back to origin"
+        );
+    }
 
     const URL: &str = "https://github.com/acme/app/issues/7";
 

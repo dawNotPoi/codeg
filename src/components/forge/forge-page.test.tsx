@@ -42,6 +42,7 @@ import {
 import { useForgeRefreshStore } from "@/stores/forge-refresh-store"
 
 const REMOTE: ForgeRemote = {
+  remote_name: "origin",
   server_host: "github.com",
   owner_repo: "xintaofei/codeg",
   remote_url: "https://github.com/xintaofei/codeg.git",
@@ -80,6 +81,7 @@ vi.mock("@/lib/api", () => ({
   // each of them.
   forgeSettingsGet: vi.fn(),
   forgeSettingsSet: vi.fn(),
+  gitListRemotes: vi.fn(),
 }))
 vi.mock("@/lib/platform", () => ({
   subscribe: vi.fn().mockResolvedValue(() => {}),
@@ -111,7 +113,9 @@ import {
   forgeListLabels,
   forgeSetItemState,
   forgeSettingsGet,
+  forgeSettingsSet,
   forgeTabCount,
+  gitListRemotes,
   workTaskLookupBySource,
 } from "@/lib/api"
 
@@ -222,6 +226,71 @@ beforeEach(() => {
   vi.mocked(forgeSettingsGet).mockResolvedValue({
     global: { writeback_default: true, scenario_prompts: {} },
     folders: {},
+  })
+  vi.mocked(gitListRemotes).mockResolvedValue([])
+})
+
+describe("ForgePage remote picker", () => {
+  it("lists the folder's remotes and saves the picked one", async () => {
+    useAppWorkspaceStore.setState({
+      folders: [
+        {
+          id: 1,
+          name: "codeg",
+          path: "/repo",
+          parent_id: null,
+          kind: "regular",
+        },
+      ] as never,
+    })
+    vi.mocked(gitListRemotes).mockResolvedValue([
+      { name: "origin", url: "https://github.com/me/codeg.git" },
+      { name: "upstream", url: "https://github.com/xintaofei/codeg.git" },
+    ])
+    vi.mocked(forgeSettingsSet).mockResolvedValue({
+      global: { writeback_default: true, scenario_prompts: {} },
+      folders: {
+        "1": {
+          writeback_default: true,
+          scenario_prompts: {},
+          remote: "upstream",
+        },
+      },
+    })
+    vi.mocked(forgeListIssues).mockResolvedValue(listOf([]))
+    // A non-default field the picker does not edit: the save must carry it.
+    vi.mocked(forgeSettingsGet).mockResolvedValue({
+      global: {
+        writeback_default: false,
+        scenario_prompts: { all: "Reply in English." },
+      },
+      folders: {},
+    })
+
+    mount()
+
+    await userEvent.click(
+      await screen.findByRole("combobox", { name: "Remote" })
+    )
+    await userEvent.click(
+      await screen.findByRole("option", { name: "upstream" })
+    )
+
+    // Saved on the FOLDER scope, carrying the rest of the settings forward.
+    await waitFor(() =>
+      expect(vi.mocked(forgeSettingsSet)).toHaveBeenCalledWith(
+        1,
+        expect.objectContaining({
+          remote: "upstream",
+          writeback_default: false,
+          scenario_prompts: { all: "Reply in English." },
+        })
+      )
+    )
+    // And the page re-reads the repository it is now pointed at.
+    await waitFor(() =>
+      expect(vi.mocked(folderForgeRemote).mock.calls.length).toBeGreaterThan(1)
+    )
   })
 })
 
@@ -376,6 +445,7 @@ describe("ForgePage list failures", () => {
  */
 describe("ForgePage sort control", () => {
   const GITEA: ForgeRemote = {
+    remote_name: "origin",
     server_host: "git.corp.example",
     owner_repo: "acme/app",
     remote_url: "https://git.corp.example/acme/app.git",
@@ -418,6 +488,7 @@ describe("ForgePage sort control", () => {
  */
 describe("ForgePage on a host that is neither forge", () => {
   const UNSUPPORTED: ForgeRemote = {
+    remote_name: "origin",
     server_host: "gitee.com",
     owner_repo: "someone/thing",
     remote_url: "https://gitee.com/someone/thing.git",
@@ -1715,9 +1786,7 @@ describe("ForgePage writes", () => {
     vi.mocked(folderForgeRemote).mockResolvedValue(null)
     vi.mocked(forgeListIssues).mockResolvedValue(listOf([]))
     mount()
-    await screen.findByText(
-      "This folder has no recognizable forge remote (origin)"
-    )
+    await screen.findByText("This folder has no recognizable forge remote")
     // Nowhere for the issue to go — the backend would refuse it, and a button
     // that can only fail is worse than no button.
     expect(

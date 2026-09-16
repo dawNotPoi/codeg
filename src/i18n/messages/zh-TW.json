@@ -5617,8 +5617,9 @@
   },
   "Forge": {
     "title": "儲存庫面板",
+    "remote": "遠端",
     "pickFolder": "選擇專案資料夾",
-    "noRemote": "該資料夾沒有可識別的程式碼託管遠端（origin）",
+    "noRemote": "該資料夾沒有可識別的程式碼託管遠端",
     "errors": {
       "noAccount": "尚未為 {host} 設定 {provider} 帳號。請先在「設定 → 版本控制」中新增，才能載入這個儲存庫。",
       "unsupportedHost": "儲存庫面板目前僅支援 GitHub、GitLab 與 Gitea，而 {host} 不屬於其中任何一種。如果它是自架的 GitHub Enterprise、GitLab、Gitea 或 Forgejo 執行個體，請在「設定 → 版本控制」中為它新增帳號。",

@@ -75,6 +75,11 @@ pub struct ForgePanelSettings {
     /// change (same contract as `stage_prompts`).
     #[serde(default)]
     pub scenario_prompts: BTreeMap<String, String>,
+    /// Which git remote the panel reads the repository from. `None` is the
+    /// historical `origin`, so a blob written before this field existed keeps
+    /// behaving exactly as it did.
+    #[serde(default)]
+    pub remote: Option<String>,
 }
 
 fn default_writeback() -> bool {
@@ -88,6 +93,7 @@ impl Default for ForgePanelSettings {
             default_pr_scenario: None,
             writeback_default: default_writeback(),
             scenario_prompts: BTreeMap::new(),
+            remote: None,
         }
     }
 }
@@ -117,6 +123,7 @@ impl ForgePanelSettings {
     fn normalized(mut self) -> Result<Self, DbError> {
         self.default_issue_scenario = trim_option(self.default_issue_scenario);
         self.default_pr_scenario = trim_option(self.default_pr_scenario);
+        self.remote = trim_option(self.remote);
         let mut prompts = BTreeMap::new();
         for (key, text) in std::mem::take(&mut self.scenario_prompts) {
             let text = text.trim().to_string();
@@ -305,6 +312,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            remote: Some("  upstream  ".into()),
         };
         let stored = settings.normalized().expect("within the cap");
         assert_eq!(stored.default_issue_scenario.as_deref(), Some("plan_first"));
@@ -312,6 +320,7 @@ mod tests {
         assert!(!stored.writeback_default);
         assert_eq!(stored.scenario_prompts.get("all").map(String::as_str), Some("keep me"));
         assert!(!stored.scenario_prompts.contains_key("fix"));
+        assert_eq!(stored.remote.as_deref(), Some("upstream"));
     }
 
     /// Over the cap is refused, not truncated: this text rides in every task

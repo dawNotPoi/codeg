@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react"
 import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import {
   Check,
   ExternalLink,
@@ -76,12 +77,15 @@ import {
   forgeListIssues,
   forgeListLabels,
   forgeSettingsGet,
+  forgeSettingsSet,
   forgeTabCount,
+  gitListRemotes,
   openSettingsWindow,
   workTaskLookupBySource,
 } from "@/lib/api"
 import {
   extractAppCommandError,
+  toErrorMessage,
   toLocalizedErrorMessage,
   type AppErrorTranslator,
 } from "@/lib/app-error"
@@ -95,7 +99,10 @@ import {
   type ForgePageSize,
 } from "@/lib/forge-list-prefs"
 import { pageCount, pageSlots } from "@/lib/forge-pagination"
-import { effectiveForgeSettings } from "@/lib/forge-settings"
+import {
+  DEFAULT_FORGE_PANEL_SETTINGS,
+  effectiveForgeSettings,
+} from "@/lib/forge-settings"
 import { openUrl, subscribe } from "@/lib/platform"
 import { cn } from "@/lib/utils"
 import type {
@@ -108,6 +115,7 @@ import type {
   ForgeTab,
   ForgeSettingsStore,
   ForgeTaskLink,
+  GitRemote,
 } from "@/lib/types"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useForgeRefreshStore } from "@/stores/forge-refresh-store"
@@ -561,9 +569,20 @@ export function ForgePage() {
     }
     return projectFolders[0]?.id ?? null
   }, [folderId, projectFolders])
+  const effectiveFolderPath = useMemo(
+    () => projectFolders.find((f) => f.id === effectiveFolderId)?.path ?? null,
+    [projectFolders, effectiveFolderId]
+  )
 
   const [remote, setRemote] = useState<ForgeRemote | null>(null)
   const [remoteLoading, setRemoteLoading] = useState(false)
+  /** Every remote in the selected folder — the picker's options. Loaded with
+   *  the folder, not with the resolved remote, so a selection that no longer
+   *  resolves still lets the user move off it. */
+  const [remotes, setRemotes] = useState<GitRemote[]>([])
+  /** Bumped after the selection is saved. The resolution effect depends on it,
+   *  so the page re-reads the repository it is now pointed at. */
+  const [remoteVersion, setRemoteVersion] = useState(0)
   /** Bumped when the backend reports it had this host's forge wrong. It is a
    *  dependency of the remote lookup, so bumping it re-derives `provider` —
    *  which is what makes the correction visible in the tab wording too, not
@@ -678,7 +697,55 @@ export function ForgePage() {
     return () => {
       cancelled = true
     }
-  }, [effectiveFolderId, forgeCorrection])
+  }, [effectiveFolderId, forgeCorrection, remoteVersion])
+
+  // The picker's options come straight from git, so the list is complete even
+  // when none of them is recognizable as a forge.
+  useEffect(() => {
+    if (effectiveFolderPath == null) {
+      setRemotes([])
+      return
+    }
+    let cancelled = false
+    gitListRemotes(effectiveFolderPath)
+      .then((list) => {
+        if (!cancelled) setRemotes(list)
+      })
+      .catch(() => {
+        if (!cancelled) setRemotes([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [effectiveFolderPath])
+
+  // Switching the remote persists the choice on the FOLDER scope, then re-runs
+  // the resolution above: the rows on screen belong to the repository the
+  // backend would read next, so the old ones must not survive the switch.
+  const handlePickRemote = useCallback(
+    async (name: string) => {
+      if (effectiveFolderId == null) return
+      try {
+        // The store may not have landed yet. Reading it here avoids saving a
+        // folder row that would drop the user's standing instructions.
+        const store = settings ?? (await forgeSettingsGet())
+        if (settings == null) setSettings(store)
+        const current = effectiveForgeSettings(store, effectiveFolderId)
+        // Spread the settings in force so every field this picker does NOT
+        // edit survives the save — enumerating them would silently drop a
+        // field added later.
+        const next = await forgeSettingsSet(effectiveFolderId, {
+          ...(current ?? DEFAULT_FORGE_PANEL_SETTINGS),
+          remote: name,
+        })
+        setSettings(next)
+        setRemoteVersion((v) => v + 1)
+      } catch (e) {
+        toast.error(toErrorMessage(e))
+      }
+    },
+    [effectiveFolderId, settings]
+  )
 
   /**
    * The remote only when codeg can actually read it.
@@ -695,6 +762,13 @@ export function ForgePage() {
    * are fetch dependencies.
    */
   const readable = remote?.supported ? remote : null
+
+  /** The folder's selected remote name even when it does not resolve — the
+   *  picker must show what the folder is set to, not only what loaded. */
+  const selectedRemoteName = useMemo(
+    () => effectiveForgeSettings(settings, effectiveFolderId)?.remote ?? null,
+    [settings, effectiveFolderId]
+  )
 
   /** Which list the rows belong to — see [`LoadedList`]. */
   const listScope = `${effectiveFolderId}:${tab}`
@@ -1408,6 +1482,9 @@ export function ForgePage() {
             folderId={effectiveFolderId}
             onPickFolder={pickFolder}
             remote={remote}
+            remotes={remotes}
+            remoteName={remote?.remote_name ?? selectedRemoteName}
+            onPickRemote={handlePickRemote}
           />
 
           {/* Only once a repository is resolved: without one there is nowhere
@@ -1847,6 +1924,9 @@ function RepoBar({
   folderId,
   onPickFolder,
   remote,
+  remotes,
+  remoteName,
+  onPickRemote,
 }: {
   folders: readonly FolderSelectOption[]
   folderId: number | null
@@ -1854,6 +1934,12 @@ function RepoBar({
   /** `null` until the folder resolves, or for a folder with no forge remote —
    *  the picker still has to be usable, so only the right half goes away. */
   remote: ForgeRemote | null
+  /** Every remote in the folder — the picker's options. */
+  remotes: GitRemote[]
+  /** The selected remote. `remote.remote_name` wins when resolution succeeded,
+   *  since that is what the rows on screen came from. */
+  remoteName: string | null
+  onPickRemote: (name: string) => void
 }) {
   const t = useTranslations("Forge")
 
@@ -1869,6 +1955,25 @@ function RepoBar({
         title={t("pickFolder")}
         variant="ghost"
       />
+      {remotes.length > 0 ? (
+        <Select value={remoteName ?? undefined} onValueChange={onPickRemote}>
+          <SelectTrigger
+            size="sm"
+            aria-label={t("remote")}
+            title={t("remote")}
+            className="h-7 w-auto gap-1 rounded-full border-transparent bg-transparent px-2 font-mono text-[0.8125rem] text-muted-foreground shadow-none hover:bg-muted"
+          >
+            <SelectValue placeholder={t("remote")} />
+          </SelectTrigger>
+          <SelectContent>
+            {remotes.map((r) => (
+              <SelectItem key={r.name} value={r.name}>
+                {r.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      ) : null}
       {remote != null ? (
         <>
           <Separator orientation="vertical" className="!h-4" />

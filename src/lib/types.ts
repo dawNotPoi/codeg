@@ -1988,6 +1988,9 @@ export interface ForgeChangedFileList {
 
 /** A folder's `origin` remote parsed into forge coordinates. */
 export interface ForgeRemote {
+  /** Which remote this was resolved from — the panel shows it so the active
+   *  choice is visible rather than inferred from the URL. */
+  remote_name: string
   server_host: string
   owner_repo: string
   remote_url: string
@@ -2077,6 +2080,8 @@ export interface ForgePanelSettings {
   /** Standing instructions appended after a scenario's built-in wording,
    *  keyed by scenario id plus the reserved `all` (every scenario). */
   scenario_prompts: Record<string, string>
+  /** Which git remote the panel reads; absent/null = the historical `origin`. */
+  remote?: string | null
 }
 
 /** Every scope of the panel's preferences — mirrors

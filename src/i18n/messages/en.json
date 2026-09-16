@@ -5617,8 +5617,9 @@
   },
   "Forge": {
     "title": "Repository panel",
+    "remote": "Remote",
     "pickFolder": "Pick a project folder",
-    "noRemote": "This folder has no recognizable forge remote (origin)",
+    "noRemote": "This folder has no recognizable forge remote",
     "errors": {
       "noAccount": "No {provider} account is configured for {host}. Add one under Settings → Version Control to load this repository.",
       "unsupportedHost": "The repository panel supports GitHub, GitLab and Gitea only, and {host} is not recognized as any of them. If it is a self-hosted GitHub Enterprise, GitLab, Gitea or Forgejo instance, add an account for it under Settings → Version Control.",

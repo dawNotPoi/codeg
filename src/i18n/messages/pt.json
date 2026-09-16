@@ -5617,8 +5617,9 @@
   },
   "Forge": {
     "title": "Painel do repositório",
+    "remote": "Remoto",
     "pickFolder": "Escolha uma pasta de projeto",
-    "noRemote": "Esta pasta não tem um remoto reconhecível (origin)",
+    "noRemote": "Esta pasta não tem um remoto reconhecível",
     "errors": {
       "noAccount": "Nenhuma conta {provider} configurada para {host}. Adicione uma em Configurações → Controle de versão para carregar este repositório.",
       "unsupportedHost": "O painel do repositório só oferece suporte a GitHub, GitLab e Gitea, e {host} não é reconhecido como nenhum deles. Se for uma instância auto-hospedada do GitHub Enterprise, GitLab, Gitea ou Forgejo, adicione uma conta para ela em Configurações → Controle de versão.",

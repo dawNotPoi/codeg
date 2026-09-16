@@ -5617,8 +5617,9 @@
   },
   "Forge": {
     "title": "لوحة المستودع",
+    "remote": "remote",
     "pickFolder": "اختر مجلد مشروع",
-    "noRemote": "لا يحتوي هذا المجلد على remote معروف (origin)",
+    "noRemote": "لا يحتوي هذا المجلد على remote معروف",
     "errors": {
       "noAccount": "لا يوجد حساب {provider} مُهيّأ للمضيف {host}. أضف حسابًا من الإعدادات ← التحكم بالإصدارات لتحميل هذا المستودع.",
       "unsupportedHost": "لوحة المستودع تدعم GitHub و GitLab و Gitea فقط، و{host} لا يُعرَف كأي منها. إذا كان مثيلًا مستضافًا ذاتيًا من GitHub Enterprise أو GitLab أو Gitea أو Forgejo، فأضف له حسابًا من الإعدادات ← التحكم بالإصدارات.",

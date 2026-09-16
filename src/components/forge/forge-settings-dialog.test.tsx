@@ -156,6 +156,21 @@ describe("ForgeSettingsDialog global scope", () => {
     expect(onSaved).toHaveBeenCalledWith({ global: settings, folders: {} })
   })
 
+  it("carries a stored remote through a save this dialog does not edit", async () => {
+    forgeSettingsGet.mockResolvedValue({
+      global: { ...GLOBAL, remote: "upstream" },
+      folders: {},
+    })
+    const user = userEvent.setup()
+    await mountLoaded()
+
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(forgeSettingsSet).toHaveBeenCalled())
+    // The panel's picker owns this field; a settings save must not clear it.
+    expect(lastSave().settings.remote).toBe("upstream")
+  })
+
   it("keeps each scenario's instruction under its own segment, and marks the ones in use", async () => {
     const user = userEvent.setup()
     await mountLoaded()

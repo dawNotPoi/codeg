@@ -5617,8 +5617,9 @@
   },
   "Forge": {
     "title": "Panel del repositorio",
+    "remote": "Remoto",
     "pickFolder": "Elige una carpeta de proyecto",
-    "noRemote": "Esta carpeta no tiene un remoto reconocible (origin)",
+    "noRemote": "Esta carpeta no tiene un remoto reconocible",
     "errors": {
       "noAccount": "No hay ninguna cuenta de {provider} configurada para {host}. Añade una en Configuración → Control de versiones para cargar este repositorio.",
       "unsupportedHost": "El panel del repositorio solo admite GitHub, GitLab y Gitea, y {host} no se reconoce como ninguno de ellos. Si es una instancia autoalojada de GitHub Enterprise, GitLab, Gitea o Forgejo, añade una cuenta para ella en Configuración → Control de versiones.",

@@ -5617,8 +5617,9 @@
   },
   "Forge": {
     "title": "Panneau du dépôt",
+    "remote": "Remote",
     "pickFolder": "Choisir un dossier de projet",
-    "noRemote": "Ce dossier n'a pas de remote reconnaissable (origin)",
+    "noRemote": "Ce dossier n'a pas de remote reconnaissable",
     "errors": {
       "noAccount": "Aucun compte {provider} n'est configuré pour {host}. Ajoutez-en un dans Paramètres → Contrôle de version pour charger ce dépôt.",
       "unsupportedHost": "Le panneau du dépôt ne prend en charge que GitHub, GitLab et Gitea, et {host} n'est reconnu comme aucun d'entre eux. S'il s'agit d'une instance auto-hébergée de GitHub Enterprise, GitLab, Gitea ou Forgejo, ajoutez-y un compte dans Paramètres → Contrôle de version.",
