@@ -633,6 +633,11 @@ export function ForgePage() {
   const [labelOptions, setLabelOptions] = useState<ForgeLabel[]>([])
   const [labelsTruncated, setLabelsTruncated] = useState(false)
   const reqRef = useRef(0)
+  /** The repository the generation above belongs to, and a counter kept in
+   *  step with it. `reqRef` is the guard for EVERY request aimed at the current
+   *  repository, so it has to be claimed when the repository changes and there
+   *  is no request of ours to claim it — see the render-phase bump below. */
+  const repoRef = useRef<string | null>(null)
   /** Rows taken from a write, keyed by item — what `reconcile` writes back
    *  over a list response that went out before the write. A ref, not state: it
    *  has to be readable by a fetch already in flight, and changing it must
@@ -763,6 +768,46 @@ export function ForgePage() {
    */
   const readable = remote?.supported ? remote : null
 
+  /**
+   * WHICH repository everything below is about.
+   *
+   * The folder alone is not the answer, and the picker is why: one folder can
+   * be pointed at several repositories in turn, so the page number, the label
+   * vocabulary and the counted rows on screen are facts about a (folder,
+   * remote) PAIR. Keyed on the folder alone they outlive the switch, and each
+   * one then reads as a fact about the repository now on screen.
+   *
+   * A NAME rather than the object, so it is a stable fetch dependency: the
+   * resolution hands back a fresh object every time, and comparing those would
+   * re-run every fetch on each re-resolution of the SAME remote.
+   */
+  const repoKey =
+    readable == null ? "none" : `${readable.server_host}/${readable.owner_repo}`
+
+  /**
+   * The switch claims a generation of its own.
+   *
+   * `reqRef` is what decides whether an answer is still wanted, and today it
+   * happens to be safe without this: the refetch for the new repository runs on
+   * the commit that resolves it and takes the next number, so an answer still in
+   * the air loses. That safety is a consequence of the refetch happening at all,
+   * though — not of anything the switch does — and the two states where it does
+   * NOT happen are exactly the ones where a stale answer can still be believed:
+   * a remote that resolves to nothing readable (no refetch is fired, so no
+   * number is claimed), and the frame between the teardown and the resolution.
+   * Taking the number here states the rule directly — a repository change
+   * invalidates everything aimed at the last one — and needs no fetch to be
+   * fired for it to hold.
+   *
+   * During RENDER, so it is claimed in the same commit that resolves the new
+   * remote and before any effect can run. Absorbed, because this runs on every
+   * render and writing state unconditionally would loop.
+   */
+  if (repoRef.current !== repoKey) {
+    repoRef.current = repoKey
+    reqRef.current += 1
+  }
+
   /** The folder's selected remote name even when it does not resolve — the
    *  picker must show what the folder is set to, not only what loaded. */
   const selectedRemoteName = useMemo(
@@ -770,11 +815,16 @@ export function ForgePage() {
     [settings, effectiveFolderId]
   )
 
-  /** Which list the rows belong to — see [`LoadedList`]. */
-  const listScope = `${effectiveFolderId}:${tab}`
+  /** Which list the rows belong to — see [`LoadedList`]. Carries the remote,
+   *  not just the folder: switching the picker swaps the repository under the
+   *  same folder id, and a page read from one forge must never be shown as the
+   *  other's. */
+  const listScope = `${effectiveFolderId}:${repoKey}:${tab}`
   /** Which RESULT SET the badges count — see [`TabCounts`]. No tab, no page,
-   *  no order: none of the three can change either number. */
-  const countsScope = `${effectiveFolderId}:${stateFilter}:${assignedMe}:${labelFilter.join(LABEL_SCOPE_SEP)}:${search}`
+   *  no order: none of the three can change either number. Remote included for
+   *  the same reason as `listScope`: the two repositories have unrelated
+   *  totals. */
+  const countsScope = `${effectiveFolderId}:${repoKey}:${stateFilter}:${assignedMe}:${labelFilter.join(LABEL_SCOPE_SEP)}:${search}`
   /**
    * Everything that decides whether a row belongs on the page being shown: the
    * folder and tab, the filter set, and the order and page number that place it
@@ -1048,16 +1098,33 @@ export function ForgePage() {
 
   // A different repository has a different label vocabulary, so a selection
   // made against the old one would filter by labels that may not exist here.
+  // The remote is part of "a different repository" — one folder can be pointed
+  // at a fork and then its parent — so the key is the pair, not the folder.
   // Derived during render rather than in an effect: this has to catch the
   // FALLBACK path too (the stored folder disappearing from the workspace), and
   // an effect would spend an extra render — and an extra request — doing it.
-  const [labelledFolder, setLabelledFolder] = useState(effectiveFolderId)
-  if (labelledFolder !== effectiveFolderId) {
-    setLabelledFolder(effectiveFolderId)
+  const [labelledScope, setLabelledScope] = useState(
+    `${effectiveFolderId}:${repoKey}`
+  )
+  if (labelledScope !== `${effectiveFolderId}:${repoKey}`) {
+    setLabelledScope(`${effectiveFolderId}:${repoKey}`)
     if (labelFilter.length > 0) {
       setLabelFilter([])
       setPage(1)
     }
+  }
+
+  // The page number belongs to the repository as much as the label selection
+  // does: page 3 of a fork is a different slice of its parent, and asking the
+  // parent for it lands the reader on rows nobody chose. Switched the same way
+  // — during render, so the reset is committed in the same pass that the new
+  // repository resolves, BEFORE any effect can fetch the old page against it.
+  const [pagedScope, setPagedScope] = useState(
+    `${effectiveFolderId}:${repoKey}`
+  )
+  if (pagedScope !== `${effectiveFolderId}:${repoKey}`) {
+    setPagedScope(`${effectiveFolderId}:${repoKey}`)
+    setPage(1)
   }
 
   // The repository's label vocabulary — once per repository, not per page:
@@ -1764,6 +1831,12 @@ export function ForgePage() {
         // list was fetched with, so a folder switch (which closes the panel —
         // see the reset effect above) cannot leave the two disagreeing.
         folderId={effectiveFolderId}
+        // Which repository that folder is pointed AT. The panel's repository
+        // facts — the account a comment is signed as, the merge methods the
+        // forge permits — are asked for by folder, so the folder alone cannot
+        // tell the panel whether its answer is still about the repository on
+        // screen. Same spelling as the scopes above, from the same value.
+        repo={repoKey}
         onOpenChange={(open) => {
           if (!open) setDetailRow(null)
         }}

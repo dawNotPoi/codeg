@@ -1867,29 +1867,34 @@ function mergeMethodText(
  */
 function useForgeIdentity(
   folderId: number | null,
+  repo: string | null | undefined,
   enabled: boolean
 ): ForgeIdentity | null {
   const [identity, setIdentity] = useState<ForgeIdentity | null>(null)
-  /** The folder the answer above describes. */
-  const [shown, setShown] = useState<number | null>(null)
+  /** The folder AND remote the answer above describes. Both, because the
+   *  folder picks the repository only until the picker points it somewhere
+   *  else — the account belongs to the repository, and one folder can name
+   *  several in turn. */
+  const [shown, setShown] = useState<string | null>(null)
   const reqRef = useRef(0)
+  const key = `${folderId}:${repo}`
 
   // Absorbed during RENDER, as [`useMergeOptions`] does: an effect would commit
   // one frame naming the account of the repository the panel just left. Keyed
-  // on the FOLDER alone, so closing the panel keeps the answer rather than
-  // blanking the avatar every time it is reopened.
-  if (folderId !== shown) {
-    setShown(folderId)
+  // on the repository rather than on the folder alone — so closing the panel
+  // keeps the answer rather than blanking the avatar every time it is reopened,
+  // while a switch to another remote DOES blank it.
+  if (key !== shown) {
+    setShown(key)
     setIdentity(null)
   }
 
   useEffect(() => {
     // Claimed BEFORE the early return, so a run that asks for nothing still
     // invalidates whatever the last one had in flight. Otherwise a lookup for
-    // the folder the panel was last opened on lands after the reader has
-    // switched repositories — the reset above has already been and gone by
-    // then, because it keys on the folder and the folder stopped changing —
-    // and the next open names an account from the repository before this one.
+    // the repository the panel was last opened on lands after the reader has
+    // switched to another — the reset above has already been and gone by then
+    // — and the next open names an account from the repository before this one.
     const id = ++reqRef.current
     if (folderId == null || !enabled) return
     void forgeIdentity(folderId)
@@ -1899,7 +1904,7 @@ function useForgeIdentity(
       .catch(() => {
         if (id === reqRef.current) setIdentity(null)
       })
-  }, [folderId, enabled])
+  }, [folderId, repo, enabled])
 
   return identity
 }
@@ -1924,18 +1929,21 @@ const FALLBACK_METHODS: readonly ForgeMergeMethod[] = ["merge"]
  */
 function useMergeOptions(
   folderId: number | null,
+  repo: string | null | undefined,
   enabled: boolean
 ): ForgeMergeOptions | null {
   const [options, setOptions] = useState<ForgeMergeOptions | null>(null)
-  /** The folder the answer above describes, so a folder switch cannot leave
-   *  one repository's permitted methods on another's button. */
-  const [shown, setShown] = useState<number | null>(null)
+  /** The folder AND remote the answer above describes, so neither a folder
+   *  switch nor a switch of the remote within it can leave one repository's
+   *  permitted methods on another's button. */
+  const [shown, setShown] = useState<string | null>(null)
   const reqRef = useRef(0)
+  const key = `${folderId}:${repo}`
 
   // Absorbed during RENDER, the same rule `useChangeDetail` follows: an effect
   // would commit one frame of the previous repository's menu.
-  if (folderId !== shown) {
-    setShown(folderId)
+  if (key !== shown) {
+    setShown(key)
     setOptions(null)
   }
 
@@ -1955,7 +1963,7 @@ function useMergeOptions(
           })
         }
       })
-  }, [folderId, enabled])
+  }, [folderId, repo, enabled])
 
   return options
 }
@@ -2209,6 +2217,7 @@ function MergeBox({
 function Conversation({
   row,
   folderId,
+  repo,
   identity,
   onCommentPosted,
   beforeComposer,
@@ -2217,6 +2226,9 @@ function Conversation({
 }: {
   row: ForgeIssueRow
   folderId: number | null
+  /** The repository `folderId` is pointed at — part of the thread's key, so a
+   *  switch of the remote resets it exactly as a switch of the item does. */
+  repo?: string | null
   /** Who a comment from here would be signed as — see [`useForgeIdentity`]. */
   identity: ForgeIdentity | null
   onCommentPosted: (item: { isPr: boolean; number: number }) => void
@@ -2267,16 +2279,19 @@ function Conversation({
         </div>
       </div>
 
-      {/* Keyed by the ITEM, not by the row object: the page re-reads the row
-          from the list on every render, so identity changes whenever anything
-          behind the panel refreshes — and a thread that remounted on each of
-          those would re-fetch, lose its loaded pages and scroll the reader back
-          to the top. The panel is non-modal, though, so clicking a different
-          row swaps the item underneath without ever closing; the key is what
-          resets it when that happens. */}
+      {/* Keyed by the ITEM *and the repository*, not by the row object: the page
+          re-reads the row from the list on every render, so identity changes
+          whenever anything behind the panel refreshes — and a thread that
+          remounted on each of those would re-fetch, lose its loaded pages and
+          scroll the reader back to the top. The panel is non-modal, though, so
+          clicking a different row swaps the item underneath without ever
+          closing; the key is what resets it when that happens. The repository
+          belongs in the key for the same reason the item does — the same number
+          names a different item in another repository, and its comments would
+          be the wrong thread entirely. */}
       {folderId != null ? (
         <CommentThread
-          key={`${row.is_pr ? "pr" : "issue"}-${row.number}`}
+          key={`${repo ?? "none"}:${row.is_pr ? "pr" : "issue"}-${row.number}`}
           folderId={folderId}
           kind={row.is_pr ? "pr" : "issue"}
           number={row.number}
@@ -2327,6 +2342,7 @@ export function ForgeIssueDetailSheet({
   row,
   link,
   folderId,
+  repo,
   onOpenChange,
   onStart,
   onRowUpdated,
@@ -2342,6 +2358,19 @@ export function ForgeIssueDetailSheet({
    *  repository from this folder's own remote). `null` while no folder is
    *  resolved, which costs the thread and nothing else. */
   folderId: number | null
+  /**
+   * WHICH repository that folder is currently pointed at, as a stable name.
+   *
+   * The panel's repository facts — the account a comment is signed as, the
+   * merge methods the forge permits — are asked for by `folderId` and answered
+   * about whatever remote the folder names at that moment, so the folder alone
+   * cannot say whether the answer in hand is still the right one. Handed down
+   * from the page (see `repoKey` there) so both sides spell the repository the
+   * same way, and `null` when nothing readable is resolved. Optional: a caller
+   * that has no repository to name (a fixture, a preview) leaves it out, which
+   * reads as "the folder's own identity" and behaves as it did before.
+   */
+  repo?: string | null
   onOpenChange: (open: boolean) => void
   /** Opens the page's trigger dialog on this item. */
   onStart: () => void
@@ -2440,11 +2469,11 @@ export function ForgeIssueDetailSheet({
     change != null &&
     row?.state === "open" &&
     (detail.detail?.state ?? "open") === "open"
-  const mergeOptions = useMergeOptions(change?.folderId ?? null, canMerge)
+  const mergeOptions = useMergeOptions(change?.folderId ?? null, repo, canMerge)
   /** Held HERE, above the thread that remounts per item — the account is a
-   *  property of the folder, not of the item being read. Gated on the panel
+   *  property of the repository, not of the item being read. Gated on the panel
    *  being open, because the drawer is mounted whether or not it is. */
-  const identity = useForgeIdentity(folderId, row != null)
+  const identity = useForgeIdentity(folderId, repo, row != null)
 
   /**
    * The element the conversation is scrolled in, for the virtualized thread
@@ -2707,6 +2736,7 @@ export function ForgeIssueDetailSheet({
               <Conversation
                 row={row}
                 folderId={folderId}
+                repo={repo}
                 identity={identity}
                 onCommentPosted={onCommentPosted}
                 viewportRef={viewportRef}
@@ -2765,6 +2795,7 @@ export function ForgeIssueDetailSheet({
             <Conversation
               row={row}
               folderId={folderId}
+              repo={repo}
               identity={identity}
               onCommentPosted={onCommentPosted}
               viewportRef={viewportRef}
