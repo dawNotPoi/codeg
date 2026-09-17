@@ -282,6 +282,7 @@ function mount(
     onRowUpdated?: (updated: ForgeIssueRow) => void
     onCommentPosted?: (item: { isPr: boolean; number: number }) => void
     folderId?: number | null
+    repo?: string | null
   } = {}
 ) {
   const onOpenChange = handlers.onOpenChange ?? vi.fn()
@@ -294,6 +295,7 @@ function mount(
         row={item}
         link={link}
         folderId={handlers.folderId === undefined ? 7 : handlers.folderId}
+        repo={handlers.repo}
         onOpenChange={onOpenChange}
         onStart={onStart}
         onRowUpdated={onRowUpdated}
@@ -302,6 +304,34 @@ function mount(
     </NextIntlClientProvider>
   )
   return { onOpenChange, onStart, onRowUpdated, onCommentPosted, view }
+}
+
+/**
+ * The panel as the PAGE renders it, repository included.
+ *
+ * The remote is a page-level fact handed down (see `repoKey` in
+ * `forge-page.tsx`), so the only way to rehearse a switch of it is to re-render
+ * this panel with another value — the folder does not move.
+ */
+function panelWithRepo(
+  item: ForgeIssueRow | null,
+  folderId: number,
+  repo: string | null
+) {
+  return (
+    <NextIntlClientProvider locale="en" messages={enMessages}>
+      <ForgeIssueDetailSheet
+        row={item}
+        link={null}
+        folderId={folderId}
+        repo={repo}
+        onOpenChange={vi.fn()}
+        onStart={vi.fn()}
+        onRowUpdated={vi.fn()}
+        onCommentPosted={vi.fn()}
+      />
+    </NextIntlClientProvider>
+  )
 }
 
 beforeEach(() => {
@@ -2675,6 +2705,121 @@ describe("ForgeIssueDetailSheet conversation rail", () => {
     expect(card).not.toBeNull()
     const column = card?.previousElementSibling
     expect(column?.firstElementChild).toHaveClass("rounded-full")
+  })
+
+  /**
+   * The repository is part of what the panel's own lookups are ABOUT, so a
+   * switch of it has to blank them, not just re-ask.
+   *
+   * `forgeIdentity` is asked for by FOLDER and answered about whatever remote
+   * that folder names — and the real backend reads the same folder, so the
+   * answer for the folder really does change under a switch. Keyed on the folder
+   * alone the panel went on naming the previous repository's account until its
+   * own request came back, over a row that had already been re-read from the new
+   * one. The window is the whole point: both requests are held open here, since
+   * an answer that resolved would paper over the stale one a moment later.
+   */
+  it("names no account from the repository the switch left, not even for a frame", async () => {
+    const settle = new Map<number, (value: ForgeIdentity) => void>()
+    forgeIdentity.mockImplementation(
+      (folderId: number) =>
+        new Promise<ForgeIdentity>((resolve) => {
+          settle.set(folderId, resolve)
+        })
+    )
+
+    const { view } = mount(row(), null, {
+      folderId: 7,
+      repo: "github.com/me/codeg",
+    })
+    await waitFor(() => expect(forgeIdentity).toHaveBeenCalledWith(7))
+    settle.get(7)?.({ username: "on-the-fork", avatar_url: null })
+    await waitFor(() =>
+      expect(
+        screen.getByRole("img", { name: "Commenting as on-the-fork" })
+      ).toBeInTheDocument()
+    )
+
+    // Same folder, other repository — the picker in action.
+    view.rerender(panelWithRepo(row(), 7, "github.com/acme/codeg-parent"))
+
+    // The new repository's lookup has gone out and has not answered, and the
+    // fork's account must not be standing in for it.
+    await waitFor(() => expect(forgeIdentity).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole("img", { name: /Commenting as/ })).toBeNull()
+
+    settle.get(7)?.({ username: "on-the-parent", avatar_url: null })
+    await waitFor(() =>
+      expect(
+        screen.getByRole("img", { name: "Commenting as on-the-parent" })
+      ).toBeInTheDocument()
+    )
+  })
+
+  /** The same rule for the merge box: which methods the forge permits is a fact
+   *  about the repository, and the box must not go on offering the fork's while
+   *  the parent's is on screen. Held open, as the account lookup is — the claim
+   *  is about the window before the new answer lands. */
+  it("withholds the merge on a repository switch until the new one answers", async () => {
+    forgeChangeDetail.mockResolvedValue({
+      number: 42,
+      base_ref: "main",
+      head_ref: "fix/timeout",
+      head_repo: null,
+      head_sha: "abc123",
+      draft: false,
+      state: "open",
+      mergeable: true,
+      merge_state: "clean",
+      additions: 1,
+      deletions: 1,
+      changed_files: 1,
+      commits: 1,
+      checks: { checks: [], available: true, partial: false },
+    })
+    // Held in a list rather than a `let … | null`: the resolve is stored from
+    // inside the mock, and TypeScript's control-flow analysis cannot see an
+    // assignment made in a callback, so it narrows a `let` back to `null` at
+    // the call site and refuses the call outright.
+    const settles: Array<(value: ForgeMergeOptions) => void> = []
+    forgeMergeOptions
+      .mockResolvedValueOnce({
+        methods: ["squash"],
+        default_method: "squash",
+        merge_strategy: "squash",
+      })
+      .mockImplementationOnce(
+        () =>
+          new Promise<ForgeMergeOptions>((resolve) => {
+            settles.push(resolve)
+          })
+      )
+
+    const mergeButton = () =>
+      screen.getByRole("button", { name: /^(Merge|Merging…)$/ })
+    const { view } = mount(row({ is_pr: true }), null, {
+      folderId: 7,
+      repo: "github.com/me/codeg",
+    })
+    await waitFor(() => expect(mergeButton()).toBeEnabled())
+
+    view.rerender(
+      panelWithRepo(row({ is_pr: true }), 7, "github.com/acme/codeg-parent")
+    )
+
+    // Blanked rather than carried over: the method the fork prefers is a claim
+    // about a repository this panel is no longer reading, and the box says so
+    // by not being willing to merge until the new repository has answered.
+    await waitFor(() => expect(forgeMergeOptions).toHaveBeenCalledTimes(2))
+    expect(mergeButton()).toBeDisabled()
+
+    // And the parent's own answer still lands when it comes.
+    settles[0]?.({
+      methods: ["merge"],
+      default_method: "merge",
+      merge_strategy: "merge_commit",
+    })
+    await waitFor(() => expect(mergeButton()).toBeEnabled())
   })
 })
 
