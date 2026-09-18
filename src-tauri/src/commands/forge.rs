@@ -426,13 +426,14 @@ pub async fn folder_forge_remote_core(
     // Resolving the selection HERE is what makes every forge operation follow
     // it: `resolve_folder_repo` calls this, so lists, comments, merges and task
     // creation all read the repository the panel is showing.
-    let settings = forge::settings::load_effective(&db.conn, folder_id)
+    // The selection has a store of its own rather than living in the panel
+    // settings: the picker saves it, and a settings save — including the "use
+    // global defaults" drop — must not be able to take it away. See
+    // `forge::remotes`.
+    let selected = forge::remotes::load_selected(&db.conn, folder_id)
         .await
         .map_err(AppCommandError::db)?;
-    let remote_name = settings
-        .remote
-        .as_deref()
-        .unwrap_or(DEFAULT_FORGE_REMOTE);
+    let remote_name = selected.as_deref().unwrap_or(DEFAULT_FORGE_REMOTE);
     let output = crate::process::tokio_command("git")
         .args(["-C", &folder.path, "remote", "get-url", remote_name])
         .output()
@@ -1049,6 +1050,28 @@ pub async fn forge_settings_set_core(
     Ok(forge::settings::save(&db.conn, folder_id, settings).await?)
 }
 
+/// Every folder's remote selection at once — what the picker reads. Held whole
+/// for the same reason the panel settings are: switching folders costs no round
+/// trip, and a selection that no longer resolves is still shown for what the
+/// folder is set to.
+pub async fn forge_remote_get_core(
+    db: &AppDatabase,
+) -> Result<forge::remotes::ForgeRemoteStore, AppCommandError> {
+    Ok(forge::remotes::load(&db.conn).await?)
+}
+
+/// Save ONE folder's selection and hand back every folder's as stored. `None`
+/// (or a blank name) puts the folder back on the default remote — the picker's
+/// "default (origin)" answer, and what lets a folder be moved off a choice
+/// WITHOUT the settings dialog (which does not edit this at all).
+pub async fn forge_remote_set_core(
+    db: &AppDatabase,
+    folder_id: i32,
+    remote: Option<String>,
+) -> Result<forge::remotes::ForgeRemoteStore, AppCommandError> {
+    Ok(forge::remotes::save(&db.conn, folder_id, remote).await?)
+}
+
 pub async fn work_task_lookup_by_source_core(
     db: &AppDatabase,
     mut source_keys: Vec<String>,
@@ -1252,6 +1275,24 @@ pub async fn forge_settings_set(
     forge_settings_set_core(&db, folder_id, settings).await
 }
 
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn forge_remote_get(
+    db: tauri::State<'_, AppDatabase>,
+) -> Result<forge::remotes::ForgeRemoteStore, AppCommandError> {
+    forge_remote_get_core(&db).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn forge_remote_set(
+    db: tauri::State<'_, AppDatabase>,
+    folder_id: i32,
+    remote: Option<String>,
+) -> Result<forge::remotes::ForgeRemoteStore, AppCommandError> {
+    forge_remote_set_core(&db, folder_id, remote).await
+}
+
 // AppCommandError ← ForgeError conversion lives in `forge::mod` (used above
 // via `?` and the explicit map for `source_key`).
 #[allow(unused)]
@@ -1300,11 +1341,7 @@ mod tests {
         assert_eq!(remote.owner_repo, "me/app");
 
         // A folder-scoped save must change what the very next read resolves.
-        let settings = crate::forge::settings::ForgePanelSettings {
-            remote: Some("upstream".into()),
-            ..Default::default()
-        };
-        crate::forge::settings::save(&db.conn, Some(folder.id), Some(settings))
+        crate::forge::remotes::save(&db.conn, folder.id, Some("upstream".into()))
             .await
             .expect("save");
 
@@ -1331,11 +1368,7 @@ mod tests {
             .await
             .expect("folder row");
 
-        let settings = crate::forge::settings::ForgePanelSettings {
-            remote: Some("upstream".into()),
-            ..Default::default()
-        };
-        crate::forge::settings::save(&db.conn, Some(folder.id), Some(settings))
+        crate::forge::remotes::save(&db.conn, folder.id, Some("upstream".into()))
             .await
             .expect("save");
 
@@ -1346,6 +1379,54 @@ mod tests {
                 .is_none(),
             "a missing selected remote must not fall back to origin"
         );
+    }
+
+    /// The maintainer's reproducer as a regression: the trigger dialog's "use
+    /// the global defaults" save DROPS the folder's whole panel-settings row,
+    /// which used to take the picker's remote selection with it — a choice the
+    /// user had watched succeed, gone on the next resolve. The selection is not
+    /// part of that row any more (see `forge::remotes`), so no settings save of
+    /// any shape can reach it.
+    #[tokio::test]
+    async fn a_settings_save_cannot_clear_the_remote_selection() {
+        use crate::db::service::folder_service;
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_run(dir.path(), &["init", "-q"]);
+        git_run(dir.path(), &["remote", "add", "origin", "https://github.com/me/app.git"]);
+        git_run(dir.path(), &["remote", "add", "upstream", "https://github.com/acme/app.git"]);
+        let folder = folder_service::add_folder(&db.conn, dir.path().to_str().unwrap())
+            .await
+            .expect("folder row");
+
+        // The picker's write: the selection, on its own.
+        crate::forge::remotes::save(&db.conn, folder.id, Some("upstream".into()))
+            .await
+            .expect("save the selection");
+
+        // Every shape of panel-settings save: the folder's own row, the global
+        // row, and the drop that "use the global defaults" performs.
+        let settings = crate::forge::settings::ForgePanelSettings {
+            writeback_default: false,
+            ..Default::default()
+        };
+        forge_settings_set_core(&db, Some(folder.id), Some(settings.clone()))
+            .await
+            .expect("folder row");
+        forge_settings_set_core(&db, None, Some(settings))
+            .await
+            .expect("global row");
+        forge_settings_set_core(&db, Some(folder.id), None)
+            .await
+            .expect("drop the folder row");
+
+        let remote = folder_forge_remote_core(&db, folder.id)
+            .await
+            .expect("resolve")
+            .expect("upstream still resolves");
+        assert_eq!(remote.remote_name, "upstream");
+        assert_eq!(remote.owner_repo, "acme/app");
     }
 
     const URL: &str = "https://github.com/acme/app/issues/7";

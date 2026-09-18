@@ -81,6 +81,10 @@ vi.mock("@/lib/api", () => ({
   // each of them.
   forgeSettingsGet: vi.fn(),
   forgeSettingsSet: vi.fn(),
+  // The panel's remote selections — read once on mount, written by the picker.
+  // Its own store, so the settings mocks above never answer for it.
+  forgeRemoteGet: vi.fn(),
+  forgeRemoteSet: vi.fn(),
   gitListRemotes: vi.fn(),
 }))
 vi.mock("@/lib/platform", () => ({
@@ -111,6 +115,8 @@ import {
   forgeCreateIssue,
   forgeListComments,
   forgeListLabels,
+  forgeRemoteGet,
+  forgeRemoteSet,
   forgeSetItemState,
   forgeSettingsGet,
   forgeSettingsSet,
@@ -227,11 +233,13 @@ beforeEach(() => {
     global: { writeback_default: true, scenario_prompts: {} },
     folders: {},
   })
+  // Nothing picked in any folder: the panel reads the default remote.
+  vi.mocked(forgeRemoteGet).mockResolvedValue({ folders: {} })
   vi.mocked(gitListRemotes).mockResolvedValue([])
 })
 
 describe("ForgePage remote picker", () => {
-  it("lists the folder's remotes and saves the picked one", async () => {
+  function mountWithRemotes() {
     useAppWorkspaceStore.setState({
       folders: [
         {
@@ -247,27 +255,15 @@ describe("ForgePage remote picker", () => {
       { name: "origin", url: "https://github.com/me/codeg.git" },
       { name: "upstream", url: "https://github.com/xintaofei/codeg.git" },
     ])
-    vi.mocked(forgeSettingsSet).mockResolvedValue({
-      global: { writeback_default: true, scenario_prompts: {} },
-      folders: {
-        "1": {
-          writeback_default: true,
-          scenario_prompts: {},
-          remote: "upstream",
-        },
-      },
-    })
     vi.mocked(forgeListIssues).mockResolvedValue(listOf([]))
-    // A non-default field the picker does not edit: the save must carry it.
-    vi.mocked(forgeSettingsGet).mockResolvedValue({
-      global: {
-        writeback_default: false,
-        scenario_prompts: { all: "Reply in English." },
-      },
-      folders: {},
-    })
-
     mount()
+  }
+
+  it("lists the folder's remotes and saves the picked one in its own store", async () => {
+    mountWithRemotes()
+    vi.mocked(forgeRemoteSet).mockResolvedValue({
+      folders: { "1": "upstream" },
+    })
 
     await userEvent.click(
       await screen.findByRole("combobox", { name: "Remote" })
@@ -276,20 +272,39 @@ describe("ForgePage remote picker", () => {
       await screen.findByRole("option", { name: "upstream" })
     )
 
-    // Saved on the FOLDER scope, carrying the rest of the settings forward.
+    // Its OWN command. A picker click must not land in the panel-settings blob:
+    // that is what used to detach the folder from the global row, and what let
+    // a later "use global defaults" save destroy the choice.
     await waitFor(() =>
-      expect(vi.mocked(forgeSettingsSet)).toHaveBeenCalledWith(
-        1,
-        expect.objectContaining({
-          remote: "upstream",
-          writeback_default: false,
-          scenario_prompts: { all: "Reply in English." },
-        })
-      )
+      expect(vi.mocked(forgeRemoteSet)).toHaveBeenCalledWith(1, "upstream")
     )
+    expect(vi.mocked(forgeSettingsSet)).not.toHaveBeenCalled()
     // And the page re-reads the repository it is now pointed at.
     await waitFor(() =>
       expect(vi.mocked(folderForgeRemote).mock.calls.length).toBeGreaterThan(1)
+    )
+  })
+
+  it("offers the default explicitly and clears the choice with it", async () => {
+    // The folder is on `upstream`. Nothing in the settings dialog edits the
+    // selection, so this item is the only way back to `origin` — and it has to
+    // CLEAR the entry rather than save the name, or the folder would look like
+    // it had chosen `origin` rather than gone back to the default.
+    vi.mocked(forgeRemoteGet).mockResolvedValue({
+      folders: { "1": "upstream" },
+    })
+    mountWithRemotes()
+    vi.mocked(forgeRemoteSet).mockResolvedValue({ folders: {} })
+
+    await userEvent.click(
+      await screen.findByRole("combobox", { name: "Remote" })
+    )
+    await userEvent.click(
+      await screen.findByRole("option", { name: "Default (origin)" })
+    )
+
+    await waitFor(() =>
+      expect(vi.mocked(forgeRemoteSet)).toHaveBeenCalledWith(1, null)
     )
   })
 })

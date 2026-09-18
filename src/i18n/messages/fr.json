@@ -5618,6 +5618,7 @@
   "Forge": {
     "title": "Panneau du dépôt",
     "remote": "Remote",
+    "remoteDefault": "Par défaut ({name})",
     "pickFolder": "Choisir un dossier de projet",
     "noRemote": "Ce dossier n'a pas de remote reconnaissable",
     "errors": {

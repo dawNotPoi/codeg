@@ -5618,6 +5618,7 @@
   "Forge": {
     "title": "Repository panel",
     "remote": "Remote",
+    "remoteDefault": "Default ({name})",
     "pickFolder": "Pick a project folder",
     "noRemote": "This folder has no recognizable forge remote",
     "errors": {

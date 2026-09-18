@@ -2080,8 +2080,6 @@ export interface ForgePanelSettings {
   /** Standing instructions appended after a scenario's built-in wording,
    *  keyed by scenario id plus the reserved `all` (every scenario). */
   scenario_prompts: Record<string, string>
-  /** Which git remote the panel reads; absent/null = the historical `origin`. */
-  remote?: string | null
 }
 
 /** Every scope of the panel's preferences — mirrors
@@ -2101,6 +2099,20 @@ export interface ForgeSettingsStore {
 
 /** Reserved `scenario_prompts` key applied to every scenario. */
 export const FORGE_SCENARIO_PROMPT_ALL = "all"
+
+/** Which git remote each folder's forge panel reads — mirrors
+ *  `forge::remotes::ForgeRemoteStore`.
+ *
+ *  Deliberately NOT a field of `ForgePanelSettings`: the picker saves this on
+ *  every click, while the panel settings are a blob the settings dialog
+ *  rewrites wholesale — so one field living in the other's blob is how "use
+ *  global defaults" came to destroy a choice the picker had already saved. */
+export interface ForgeRemoteStore {
+  /** Keyed by folder id (JSON has no integer keys, so they arrive as strings).
+   *  A folder with no entry reads the historical `origin` — absence IS the
+   *  default answer, so there is no global row to fall back to. */
+  folders: Record<string, string>
+}
 
 /** Discriminated trigger outcome — duplicate/mismatch are answers, not errors. */
 export type ForgeCreateResult =

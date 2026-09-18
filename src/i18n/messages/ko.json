@@ -5618,6 +5618,7 @@
   "Forge": {
     "title": "리포지토리 패널",
     "remote": "원격",
+    "remoteDefault": "기본값({name})",
     "pickFolder": "프로젝트 폴더 선택",
     "noRemote": "이 폴더에는 인식 가능한 원격 저장소가 없습니다",
     "errors": {
