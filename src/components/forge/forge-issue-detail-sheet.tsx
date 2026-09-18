@@ -96,6 +96,7 @@ import {
   forgeSetItemState,
 } from "@/lib/api"
 import {
+  isForgeWriteMismatch,
   type AppErrorTranslator,
   toLocalizedErrorMessage,
 } from "@/lib/app-error"
@@ -110,6 +111,7 @@ import type {
   ForgeCheckList,
   ForgeCheckState,
   ForgeComment,
+  ForgeExpectedRepo,
   ForgeIdentity,
   ForgeIssueRow,
   ForgeMergeMethod,
@@ -275,6 +277,8 @@ function CommentThread({
   kind,
   number,
   identity,
+  expected,
+  onStaleRepository,
   onPosted,
   beforeComposer,
   viewportRef,
@@ -287,6 +291,12 @@ function CommentThread({
    *  thread is keyed by the ITEM and remounts as the reader clicks the list,
    *  while the identity is a property of the folder. */
   identity: ForgeIdentity | null
+  /** The repository on screen, passed to the composer so a post is REFUSED
+   *  rather than landing in whichever repository the folder reads by the time
+   *  it arrives. See [`CommentComposer`]. */
+  expected: ForgeExpectedRepo | null
+  /** That refusal reached the composer: the page re-resolves. */
+  onStaleRepository: () => void
   /** A comment landed on the forge, and here it is. The caller bumps the
    *  item's count so the header stops trailing the thread underneath it. */
   onPosted: (comment: ForgeComment) => void
@@ -487,6 +497,8 @@ function CommentThread({
         kind={kind}
         number={number}
         identity={identity}
+        expected={expected}
+        onStaleRepository={onStaleRepository}
         onPosted={(comment) => {
           // Into its own slot, not into the paged collection — see `posted`
           // for why that ordering and that race both matter. Nothing is
@@ -674,6 +686,8 @@ function CommentComposer({
   kind,
   number,
   identity,
+  expected,
+  onStaleRepository,
   onPosted,
 }: {
   folderId: number
@@ -682,6 +696,13 @@ function CommentComposer({
   /** Who the comment would be signed as, or `null` while that is still being
    *  resolved — or could not be. See [`useForgeIdentity`]. */
   identity: ForgeIdentity | null
+  /** The repository the panel is showing, so the post can be REFUSED rather
+   *  than land in whichever one the folder's selection names by the time it
+   *  arrives. `null` = name nothing, which is the old behaviour. */
+  expected: ForgeExpectedRepo | null
+  /** The refusal above means the panel is stale: hand it to the page, which
+   *  re-resolves and tears this panel down with it. */
+  onStaleRepository: () => void
   onPosted: (comment: ForgeComment) => void
 }) {
   const t = useTranslations("Forge")
@@ -698,21 +719,46 @@ function CommentComposer({
     setPosting(true)
     setFailure(null)
     try {
-      const comment = await forgeCreateComment(folderId, {
-        kind,
-        number,
-        body: trimmed,
-      })
+      const comment = await forgeCreateComment(
+        folderId,
+        {
+          kind,
+          number,
+          body: trimmed,
+        },
+        expected
+      )
       // Only now — a draft cleared before the answer would lose what somebody
       // wrote to a network failure they cannot retry from.
       setBody("")
       onPosted(comment)
     } catch (error) {
+      if (isForgeWriteMismatch(error)) {
+        // The folder has moved to another repository, so this panel is stale
+        // and the page is about to re-resolve — which unmounts this composer
+        // and the strip with it. A toast survives the teardown, so the reason
+        // is still readable after the panel it belonged to is gone.
+        toast.error(
+          toLocalizedErrorMessage(error, tRoot as unknown as AppErrorTranslator)
+        )
+        onStaleRepository()
+        return
+      }
       setFailure({ error })
     } finally {
       setPosting(false)
     }
-  }, [folderId, kind, number, onPosted, posting, trimmed])
+  }, [
+    expected,
+    folderId,
+    kind,
+    number,
+    onPosted,
+    onStaleRepository,
+    posting,
+    tRoot,
+    trimmed,
+  ])
 
   return (
     <div className={RAIL}>
@@ -845,6 +891,11 @@ type FileStatusLabelKey =
  */
 const RAIL = "flex gap-2.5"
 const RAIL_BODY = "min-w-0 flex-1"
+
+/** Stands in for a caller that wired no re-resolve — a fixture, a preview. A
+ *  fresh arrow per render would also invalidate every `useCallback` that
+ *  depends on it, which is the other reason this is one shared value. */
+const NO_OP = () => {}
 
 /**
  * The gutter's own column, and what pins what sits in it.
@@ -2218,6 +2269,8 @@ function Conversation({
   row,
   folderId,
   repo,
+  expected,
+  onStaleRepository,
   identity,
   onCommentPosted,
   beforeComposer,
@@ -2229,6 +2282,10 @@ function Conversation({
   /** The repository `folderId` is pointed at — part of the thread's key, so a
    *  switch of the remote resets it exactly as a switch of the item does. */
   repo?: string | null
+  /** The same repository as the pair every write carries. See
+   *  [`ForgeIssueDetailSheet`] — this only passes it down. */
+  expected: ForgeExpectedRepo | null
+  onStaleRepository: () => void
   /** Who a comment from here would be signed as — see [`useForgeIdentity`]. */
   identity: ForgeIdentity | null
   onCommentPosted: (item: { isPr: boolean; number: number }) => void
@@ -2296,6 +2353,8 @@ function Conversation({
           kind={row.is_pr ? "pr" : "issue"}
           number={row.number}
           identity={identity}
+          expected={expected}
+          onStaleRepository={onStaleRepository}
           // The ITEM, not a row: this fires when the POST resolves, and by
           // then a close or a list load may have produced a newer copy that a
           // snapshot taken at submit time would overwrite.
@@ -2343,6 +2402,8 @@ export function ForgeIssueDetailSheet({
   link,
   folderId,
   repo,
+  expected = null,
+  onStaleRepository = NO_OP,
   onOpenChange,
   onStart,
   onRowUpdated,
@@ -2371,6 +2432,21 @@ export function ForgeIssueDetailSheet({
    * reads as "the folder's own identity" and behaves as it did before.
    */
   repo?: string | null
+  /**
+   * The repository this panel is SHOWING, as the pair every write carries
+   * (see `ForgeExpectedRepo`). `repo` above is the same fact spelled for a
+   * key; this is the spelling the backend can compare, so a write cannot be
+   * redirected into whatever repository the folder reads by the time it
+   * arrives. `null` sends none, which is the old behaviour.
+   */
+  expected?: ForgeExpectedRepo | null
+  /**
+   * A write came back refused because the folder has moved to another
+   * repository — the page's job to re-resolve, which re-renders this panel
+   * against the new one. The message is shown either way; this is the part
+   * that FIXES the panel rather than merely reporting it.
+   */
+  onStaleRepository?: () => void
   onOpenChange: (open: boolean) => void
   /** Opens the page's trigger dialog on this item. */
   onStart: () => void
@@ -2526,11 +2602,15 @@ export function ForgeIssueDetailSheet({
       if (row == null || folderId == null) return
       setChanging(true)
       try {
-        const updated = await forgeSetItemState(folderId, {
-          kind: row.is_pr ? "pr" : "issue",
-          number: row.number,
-          action,
-        })
+        const updated = await forgeSetItemState(
+          folderId,
+          {
+            kind: row.is_pr ? "pr" : "issue",
+            number: row.number,
+            action,
+          },
+          expected
+        )
         setPendingAction(null)
         onRowUpdated(mergeForgeRowUpdate(row, updated))
       } catch (error) {
@@ -2539,11 +2619,14 @@ export function ForgeIssueDetailSheet({
         toast.error(
           toLocalizedErrorMessage(error, tRoot as unknown as AppErrorTranslator)
         )
+        // Refused because the folder has moved on: the page re-resolves, and
+        // this panel goes with it. The toast above outlives both.
+        if (isForgeWriteMismatch(error)) onStaleRepository()
       } finally {
         setChanging(false)
       }
     },
-    [folderId, onRowUpdated, row, tRoot]
+    [expected, folderId, onRowUpdated, onStaleRepository, row, tRoot]
   )
 
   const reloadDetail = detail.reload
@@ -2552,16 +2635,20 @@ export function ForgeIssueDetailSheet({
       if (row == null || folderId == null) return
       setMerging(true)
       try {
-        const updated = await forgeMergeChange(folderId, {
-          number: row.number,
-          method: pending.method,
-          // The commit the DIALOG was armed with, not whatever the panel holds
-          // now. The diff, the file list and the checks all describe that one,
-          // so a merge that quietly landed a newer one would land code nobody
-          // in this conversation ever saw. Both forges answer 409 if the branch
-          // has moved, in their own words.
-          headSha: pending.headSha,
-        })
+        const updated = await forgeMergeChange(
+          folderId,
+          {
+            number: row.number,
+            method: pending.method,
+            // The commit the DIALOG was armed with, not whatever the panel holds
+            // now. The diff, the file list and the checks all describe that one,
+            // so a merge that quietly landed a newer one would land code nobody
+            // in this conversation ever saw. Both forges answer 409 if the branch
+            // has moved, in their own words.
+            headSha: pending.headSha,
+          },
+          expected
+        )
         setPendingMerge(null)
         // `null` is "it merged, and the row could not be read back" — GitHub's
         // merge response does not contain the pull request, so the row costs a
@@ -2589,6 +2676,11 @@ export function ForgeIssueDetailSheet({
         toast.error(
           toLocalizedErrorMessage(error, tRoot as unknown as AppErrorTranslator)
         )
+        // A refusal because the folder has moved on is the one failure here
+        // the page can FIX (see the prop's note) — and it must, because every
+        // later action in this panel would be aimed at the same stale
+        // repository.
+        if (isForgeWriteMismatch(error)) onStaleRepository()
         // The confirmation is DISMISSED on failure, unlike the close/reopen
         // one that stays put. It has to be: the likeliest refusal is "Head
         // branch was modified. Review and try the merge again.", and the whole
@@ -2604,7 +2696,16 @@ export function ForgeIssueDetailSheet({
         setMerging(false)
       }
     },
-    [folderId, onRowUpdated, reloadDetail, row, t, tRoot]
+    [
+      expected,
+      folderId,
+      onRowUpdated,
+      onStaleRepository,
+      reloadDetail,
+      row,
+      t,
+      tRoot,
+    ]
   )
 
   if (row == null) return null
@@ -2737,6 +2838,8 @@ export function ForgeIssueDetailSheet({
                 row={row}
                 folderId={folderId}
                 repo={repo}
+                expected={expected}
+                onStaleRepository={onStaleRepository}
                 identity={identity}
                 onCommentPosted={onCommentPosted}
                 viewportRef={viewportRef}
@@ -2796,6 +2899,8 @@ export function ForgeIssueDetailSheet({
               row={row}
               folderId={folderId}
               repo={repo}
+              expected={expected}
+              onStaleRepository={onStaleRepository}
               identity={identity}
               onCommentPosted={onCommentPosted}
               viewportRef={viewportRef}

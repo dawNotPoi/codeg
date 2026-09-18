@@ -5777,6 +5777,7 @@
     "previewEmpty": "(sem descrição)",
     "duplicateBody": "Já existe uma tarefa ativa para este item: {title} ({status}). Criar outra mesmo assim?",
     "folderMismatch": "O remoto desta pasta é {remote}, não o repositório deste issue — escolha a pasta correspondente.",
+    "writeMismatch": "Este painel mostrava {expected}, mas o remoto da pasta agora é {actual} — a gravação foi recusada em vez de enviada para o repositório errado. O painel foi atualizado; tente novamente.",
     "cancel": "Cancelar",
     "create": "Criar tarefa",
     "creating": "Criando…",

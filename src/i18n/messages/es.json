@@ -5777,6 +5777,7 @@
     "previewEmpty": "(sin descripción)",
     "duplicateBody": "Ya hay una tarea activa para este elemento: {title} ({status}). ¿Crear otra de todos modos?",
     "folderMismatch": "El remoto de esta carpeta es {remote}, no el repositorio de este issue: elige la carpeta correcta.",
+    "writeMismatch": "Este panel mostraba {expected}, pero el remoto de la carpeta ahora es {actual}: la escritura se rechazó en lugar de enviarla al repositorio equivocado. El panel se ha actualizado; inténtalo de nuevo.",
     "cancel": "Cancelar",
     "create": "Crear tarea",
     "creating": "Creando…",

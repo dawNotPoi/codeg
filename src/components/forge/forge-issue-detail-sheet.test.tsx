@@ -29,6 +29,7 @@ import type {
   ForgeCheck,
   ForgeComment,
   ForgeCommentList,
+  ForgeExpectedRepo,
   ForgeIdentity,
   ForgeIssueRow,
   ForgeLabel,
@@ -283,12 +284,17 @@ function mount(
     onCommentPosted?: (item: { isPr: boolean; number: number }) => void
     folderId?: number | null
     repo?: string | null
+    /** The pair a write carries — the repository the panel is showing. */
+    expected?: ForgeExpectedRepo | null
+    /** Called when a write comes back refused as stale. */
+    onStaleRepository?: () => void
   } = {}
 ) {
   const onOpenChange = handlers.onOpenChange ?? vi.fn()
   const onStart = handlers.onStart ?? vi.fn()
   const onRowUpdated = handlers.onRowUpdated ?? vi.fn()
   const onCommentPosted = handlers.onCommentPosted ?? vi.fn()
+  const onStaleRepository = handlers.onStaleRepository ?? vi.fn()
   const view = render(
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <ForgeIssueDetailSheet
@@ -296,6 +302,8 @@ function mount(
         link={link}
         folderId={handlers.folderId === undefined ? 7 : handlers.folderId}
         repo={handlers.repo}
+        expected={handlers.expected}
+        onStaleRepository={onStaleRepository}
         onOpenChange={onOpenChange}
         onStart={onStart}
         onRowUpdated={onRowUpdated}
@@ -303,7 +311,14 @@ function mount(
       />
     </NextIntlClientProvider>
   )
-  return { onOpenChange, onStart, onRowUpdated, onCommentPosted, view }
+  return {
+    onOpenChange,
+    onStart,
+    onRowUpdated,
+    onCommentPosted,
+    onStaleRepository,
+    view,
+  }
 }
 
 /**
@@ -989,13 +1004,19 @@ describe("ForgeIssueDetailSheet writes", () => {
     await user.click(screen.getByRole("button", { name: "Comment" }))
 
     await waitFor(() =>
-      expect(forgeCreateComment).toHaveBeenCalledWith(7, {
-        kind: "issue",
-        number: 42,
-        // Trimmed before it goes out — a comment padded with what a keyboard
-        // left behind is one nobody meant to publish.
-        body: "looks fixed",
-      })
+      expect(forgeCreateComment).toHaveBeenCalledWith(
+        7,
+        {
+          kind: "issue",
+          number: 42,
+          // Trimmed before it goes out — a comment padded with what a keyboard
+          // left behind is one nobody meant to publish.
+          body: "looks fixed",
+        },
+        // No repository named by this caller — see the test below for the one
+        // that does.
+        null
+      )
     )
     expect(await screen.findByText("looks fixed")).toBeInTheDocument()
     expect(screen.getByText("alice")).toBeInTheDocument()
@@ -1038,6 +1059,93 @@ describe("ForgeIssueDetailSheet writes", () => {
     expect(submit).toBeDisabled()
   })
 
+  /** What the backend answers with when the coordinates a write carried no
+   *  longer match the folder's remote (see `WRITE_MISMATCH_I18N_KEY`). */
+  const writeMismatch = {
+    code: "configuration_invalid",
+    message:
+      "this panel was showing github.com/me/app, but the folder's remote is now github.com/acme/app",
+    i18n_key: "Forge.writeMismatch",
+    i18n_params: {
+      expected: "github.com/me/app",
+      actual: "github.com/acme/app",
+    },
+  }
+
+  it("carries the repository this panel is showing on the post", async () => {
+    const user = userEvent.setup()
+    forgeListComments.mockResolvedValue(commentPage([]))
+    forgeCreateComment.mockResolvedValue(comment({ id: "991", body: "hi" }))
+    mount(row(), null, {
+      expected: {
+        expectedServerHost: "github.com",
+        expectedOwnerRepo: "me/app",
+      },
+    })
+    await screen.findByText("No comments yet")
+
+    await user.type(screen.getByPlaceholderText("Leave a comment…"), "hi")
+    await user.click(screen.getByRole("button", { name: "Comment" }))
+
+    await waitFor(() =>
+      expect(forgeCreateComment).toHaveBeenCalledWith(
+        7,
+        expect.objectContaining({ body: "hi" }),
+        { expectedServerHost: "github.com", expectedOwnerRepo: "me/app" }
+      )
+    )
+  })
+
+  it("hands a stale-repository refusal to the page instead of only reporting it", async () => {
+    const user = userEvent.setup()
+    forgeListComments.mockResolvedValue(commentPage([]))
+    forgeCreateComment.mockRejectedValue(writeMismatch)
+    const { onStaleRepository, onCommentPosted } = mount(row(), null, {
+      expected: {
+        expectedServerHost: "github.com",
+        expectedOwnerRepo: "me/app",
+      },
+    })
+    await screen.findByText("No comments yet")
+
+    await user.type(
+      screen.getByPlaceholderText("Leave a comment…"),
+      "meant for the fork"
+    )
+    await user.click(screen.getByRole("button", { name: "Comment" }))
+
+    // The panel is stale, so re-resolving is the only fix — this is the
+    // callback the page turns into one. Nothing was published, and nothing was
+    // adopted as if it had been.
+    await waitFor(() => expect(onStaleRepository).toHaveBeenCalled())
+    expect(onCommentPosted).not.toHaveBeenCalled()
+  })
+
+  it("does the same for a close the folder has moved out from under", async () => {
+    const user = userEvent.setup()
+    forgeSetItemState.mockRejectedValue(writeMismatch)
+    const { onStaleRepository, onRowUpdated } = mount(row(), null, {
+      expected: {
+        expectedServerHost: "github.com",
+        expectedOwnerRepo: "me/app",
+      },
+    })
+
+    await user.click(
+      screen.getByRole("button", { name: "Close #42 on the forge" })
+    )
+    await user.click(
+      within(screen.getByRole("alertdialog")).getByRole("button", {
+        name: "Close",
+      })
+    )
+
+    await waitFor(() => expect(onStaleRepository).toHaveBeenCalled())
+    // Not flipped locally: the write never happened, and pretending it did is
+    // the guess this panel refuses to make everywhere else.
+    expect(onRowUpdated).not.toHaveBeenCalled()
+  })
+
   it("confirms a close, then adopts the row the forge answered with", async () => {
     const user = userEvent.setup()
     // GitHub's PATCH answers with bare label names on GitLab; here the point
@@ -1060,11 +1168,15 @@ describe("ForgeIssueDetailSheet writes", () => {
       })
     )
     await waitFor(() =>
-      expect(forgeSetItemState).toHaveBeenCalledWith(7, {
-        kind: "issue",
-        number: 42,
-        action: "close",
-      })
+      expect(forgeSetItemState).toHaveBeenCalledWith(
+        7,
+        {
+          kind: "issue",
+          number: 42,
+          action: "close",
+        },
+        null
+      )
     )
     await waitFor(() => expect(onRowUpdated).toHaveBeenCalled())
     const adopted = vi.mocked(onRowUpdated).mock.calls[0][0] as ForgeIssueRow
@@ -2163,14 +2275,18 @@ describe("ForgeIssueDetailSheet merge box", () => {
     await user.click(screen.getByRole("button", { name: "Squash and merge" }))
 
     await waitFor(() =>
-      expect(forgeMergeChange).toHaveBeenCalledWith(7, {
-        number: 42,
-        method: "squash",
-        // The commit the panel DECIDED on — its diff, its files and its checks
-        // all describe this one. Both forges refuse with a 409 if the branch
-        // has moved, which is the point of sending it.
-        headSha: "abc123",
-      })
+      expect(forgeMergeChange).toHaveBeenCalledWith(
+        7,
+        {
+          number: 42,
+          method: "squash",
+          // The commit the panel DECIDED on — its diff, its files and its checks
+          // all describe this one. Both forges refuse with a 409 if the branch
+          // has moved, which is the point of sending it.
+          headSha: "abc123",
+        },
+        null
+      )
     )
     // The FORGE's row, not a local flip: GitHub has no merged state, and only
     // its answer knows this one landed rather than closed.
@@ -2239,7 +2355,8 @@ describe("ForgeIssueDetailSheet merge box", () => {
     await waitFor(() =>
       expect(forgeMergeChange).toHaveBeenCalledWith(
         7,
-        expect.objectContaining({ headSha: "reviewed1" })
+        expect.objectContaining({ headSha: "reviewed1" }),
+        null
       )
     )
   })

@@ -5777,6 +5777,7 @@
     "previewEmpty": "（无描述）",
     "duplicateBody": "已有一个活跃任务在处理该条目：{title}（{status}）。仍要再建一个吗？",
     "folderMismatch": "当前文件夹的远端是 {remote}，与该 Issue 的仓库不一致——请选择匹配的文件夹。",
+    "writeMismatch": "这个面板显示的是 {expected}，但该文件夹的远端现在是 {actual} —— 写入已被拒绝，而不是发到错误的仓库。面板已刷新，请重试。",
     "cancel": "取消",
     "create": "创建待办任务",
     "creating": "创建中…",

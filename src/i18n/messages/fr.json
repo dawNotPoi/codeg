@@ -5777,6 +5777,7 @@
     "previewEmpty": "(aucune description)",
     "duplicateBody": "Une tâche active traite déjà cet élément : {title} ({status}). En créer une autre quand même ?",
     "folderMismatch": "Le remote de ce dossier est {remote}, pas le dépôt de cette issue — choisissez le bon dossier.",
+    "writeMismatch": "Ce panneau affichait {expected}, mais le dépôt distant du dossier est désormais {actual} — l’écriture a été refusée plutôt qu’envoyée au mauvais dépôt. Le panneau a été actualisé ; réessayez.",
     "cancel": "Annuler",
     "create": "Créer la tâche",
     "creating": "Création…",
