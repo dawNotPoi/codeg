@@ -194,6 +194,14 @@ pub const UNSUPPORTED_HOST_I18N_KEY: &str = "Forge.errors.unsupportedHost";
 /// [`NO_ACCOUNT_I18N_KEY`] is.
 pub const WRONG_FORGE_I18N_KEY: &str = "Forge.errors.wrongForge";
 
+/// i18n key for the refusal a WRITE gets when the coordinates it carried no
+/// longer match the folder's remote (see [`ExpectedCoordinates`]). Root-dotted
+/// like the others, and its own key rather than the trigger's
+/// `Forge.folderMismatch`: that sentence is written about an ISSUE's
+/// repository, and reading it over a comment, a close or a merge names the
+/// wrong thing. Same judgement, same recovery, its own words.
+pub const WRITE_MISMATCH_I18N_KEY: &str = "Forge.writeMismatch";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
     /// No usable account/token for the requested host (or the token is dead).
@@ -390,6 +398,41 @@ pub fn parse_remote_url(url: &str) -> Option<(String, String)> {
         return None;
     }
     Some((host, normalize_repo(path)?))
+}
+
+/// Where the client believes the folder's repository is, carried by every
+/// WRITE so a stale view cannot be redirected into another repository.
+///
+/// The panel is not the only client: the same folder can be open in a second
+/// window, in a browser tab against this server, or in an old build, and the
+/// repository a folder reads is mutable state (see `forge::remotes`). A write
+/// that names no repository follows whatever the selection says NOW — which is
+/// how a comment meant for one repository lands in another.
+///
+/// Both fields are optional in the wire form, and a client that sends neither
+/// keeps the old behaviour exactly. Flattened into each request rather than
+/// nested, so the write payloads keep the flat shape their other fields have.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpectedCoordinates {
+    #[serde(default)]
+    pub expected_server_host: Option<String>,
+    #[serde(default)]
+    pub expected_owner_repo: Option<String>,
+}
+
+impl ExpectedCoordinates {
+    /// The pair to compare against, or `None` when the client named neither
+    /// side — or only one. Half a coordinate cannot be compared, and inventing
+    /// the other half would turn a stale client into a wrong refusal.
+    pub fn pair(&self) -> Option<(&str, &str)> {
+        let host = self.expected_server_host.as_deref()?.trim();
+        let repo = self.expected_owner_repo.as_deref()?.trim();
+        if host.is_empty() || repo.is_empty() {
+            return None;
+        }
+        Some((host, repo))
+    }
 }
 
 /// Provenance snapshot stored in `work_task.source_meta` (JSON) and mirrored
@@ -1008,6 +1051,8 @@ pub struct CommentDraft {
     pub body: String,
     #[serde(default)]
     pub account_id: Option<String>,
+    #[serde(flatten)]
+    pub expected: ExpectedCoordinates,
 }
 
 impl CommentDraft {
@@ -1081,6 +1126,8 @@ pub struct StateChangeRequest {
     pub action: ForgeStateAction,
     #[serde(default)]
     pub account_id: Option<String>,
+    #[serde(flatten)]
+    pub expected: ExpectedCoordinates,
 }
 
 impl StateChangeRequest {
@@ -1201,6 +1248,8 @@ pub struct ChangeMergeRequest {
     pub head_sha: Option<String>,
     #[serde(default)]
     pub account_id: Option<String>,
+    #[serde(flatten)]
+    pub expected: ExpectedCoordinates,
 }
 
 impl ChangeMergeRequest {
@@ -1233,6 +1282,8 @@ pub struct NewIssueDraft {
     pub labels: Vec<String>,
     #[serde(default)]
     pub account_id: Option<String>,
+    #[serde(flatten)]
+    pub expected: ExpectedCoordinates,
 }
 
 /// A validated new issue — the only shape a provider client will take.
@@ -1746,6 +1797,70 @@ mod tests {
         assert!(serde_json::to_value(&dead_token).unwrap().get("i18n_key").is_none());
     }
 
+    /// Coordinates are only comparable when BOTH halves arrive. With one of
+    /// them missing there is nothing to compare, and inventing the other half
+    /// would turn a stale client into a wrong refusal.
+    #[test]
+    fn expected_coordinates_need_both_halves_to_be_comparable() {
+        let both = ExpectedCoordinates {
+            expected_server_host: Some("  github.com ".into()),
+            expected_owner_repo: Some(" me/app ".into()),
+        };
+        assert_eq!(both.pair(), Some(("github.com", "me/app")));
+
+        assert_eq!(ExpectedCoordinates::default().pair(), None);
+        assert_eq!(
+            ExpectedCoordinates {
+                expected_server_host: Some("github.com".into()),
+                expected_owner_repo: None,
+            }
+            .pair(),
+            None,
+            "half a coordinate cannot be compared"
+        );
+        assert_eq!(
+            ExpectedCoordinates {
+                expected_server_host: Some("  ".into()),
+                expected_owner_repo: Some("me/app".into()),
+            }
+            .pair(),
+            None
+        );
+    }
+
+    /// The shape a write actually puts on the wire: the pair rides FLAT beside
+    /// the request's own fields, and a payload from a build that predates the
+    /// check decodes to "named nothing" rather than failing to decode at all.
+    #[test]
+    fn a_write_payload_carries_its_coordinates_flat() {
+        let draft: CommentDraft = serde_json::from_str(
+            r#"{"kind":"issue","number":7,"body":"hi","expectedServerHost":"github.com","expectedOwnerRepo":"me/app"}"#,
+        )
+        .expect("decodes");
+        assert_eq!(draft.expected.pair(), Some(("github.com", "me/app")));
+
+        let old: CommentDraft =
+            serde_json::from_str(r#"{"kind":"issue","number":7,"body":"hi"}"#).expect("decodes");
+        assert_eq!(old.expected.pair(), None);
+
+        // The other three write payloads flatten the same pair.
+        let merge: ChangeMergeRequest = serde_json::from_str(
+            r#"{"number":7,"method":"merge","expectedServerHost":"github.com","expectedOwnerRepo":"me/app"}"#,
+        )
+        .expect("decodes");
+        assert_eq!(merge.expected.pair(), Some(("github.com", "me/app")));
+        let state: StateChangeRequest = serde_json::from_str(
+            r#"{"kind":"pr","number":7,"action":"close","expectedServerHost":"github.com","expectedOwnerRepo":"me/app"}"#,
+        )
+        .expect("decodes");
+        assert_eq!(state.expected.pair(), Some(("github.com", "me/app")));
+        let issue: NewIssueDraft = serde_json::from_str(
+            r#"{"title":"t","expectedServerHost":"github.com","expectedOwnerRepo":"me/app"}"#,
+        )
+        .expect("decodes");
+        assert_eq!(issue.expected.pair(), Some(("github.com", "me/app")));
+    }
+
     #[test]
     fn source_key_normalizes_and_validates() {
         assert_eq!(
@@ -2217,6 +2332,7 @@ mod tests {
             number,
             body: body.into(),
             account_id: None,
+            expected: ExpectedCoordinates::default(),
         };
         assert_eq!(
             draft("issue", 7, "  looks fixed  ").resolve().unwrap(),
@@ -2278,6 +2394,7 @@ mod tests {
             body: body.map(str::to_string),
             labels: labels.into_iter().map(str::to_string).collect(),
             account_id: None,
+            expected: ExpectedCoordinates::default(),
         };
         assert_eq!(
             draft("  Login times out  ", Some("  steps  "), vec![" bug ", "", "bug", "docs"])
@@ -2301,6 +2418,7 @@ mod tests {
             body: None,
             labels: distinct.clone(),
             account_id: None,
+            expected: ExpectedCoordinates::default(),
         }
         .resolve()
         .unwrap();
@@ -2314,6 +2432,7 @@ mod tests {
                 body: None,
                 labels: absurd,
                 account_id: None,
+                expected: ExpectedCoordinates::default(),
             }
             .resolve()
             .unwrap()

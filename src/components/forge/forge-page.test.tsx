@@ -85,6 +85,17 @@ vi.mock("@/lib/api", () => ({
   // Its own store, so the settings mocks above never answer for it.
   forgeRemoteGet: vi.fn(),
   forgeRemoteSet: vi.fn(),
+  // Called DURING RENDER to build the pair every write carries, so this mock
+  // has to answer like the real helper rather than like a spy.
+  forgeExpectedRepo: (
+    remote: { server_host: string; owner_repo: string } | null
+  ) =>
+    remote === null
+      ? null
+      : {
+          expectedServerHost: remote.server_host,
+          expectedOwnerRepo: remote.owner_repo,
+        },
   gitListRemotes: vi.fn(),
 }))
 vi.mock("@/lib/platform", () => ({
@@ -1976,7 +1987,13 @@ describe("ForgePage writes", () => {
     await waitFor(() =>
       expect(forgeCreateIssue).toHaveBeenCalledWith(
         1,
-        expect.objectContaining({ title: "Login times out" })
+        expect.objectContaining({ title: "Login times out" }),
+        // The repository the page is SHOWING, handed to the dialog so the
+        // write is refused rather than redirected if the folder has moved.
+        {
+          expectedServerHost: "github.com",
+          expectedOwnerRepo: "xintaofei/codeg",
+        }
       )
     )
     // Straight into the panel on what was just filed: the number and the link
@@ -1991,6 +2008,39 @@ describe("ForgePage writes", () => {
     const rows = await screen.findAllByRole("button", { name: /Login times/ })
     expect(rows.length).toBeGreaterThan(0)
     expect(vi.mocked(forgeListIssues).mock.calls.length).toBe(before)
+  })
+
+  it("re-resolves the repository when a write says the folder has moved on", async () => {
+    const user = userEvent.setup()
+    vi.mocked(forgeListIssues).mockResolvedValue(listOf([]))
+    // What the backend answers with when the coordinates a write carried no
+    // longer match the folder's remote (`WRITE_MISMATCH_I18N_KEY`): the write
+    // was refused, and the page's job is to stop showing a repository the
+    // folder has left.
+    vi.mocked(forgeCreateIssue).mockRejectedValue({
+      code: "configuration_invalid",
+      message: "this panel was showing github.com/xintaofei/codeg",
+      i18n_key: "Forge.writeMismatch",
+      i18n_params: {
+        expected: "github.com/xintaofei/codeg",
+        actual: "github.com/acme/other",
+      },
+    })
+    mount()
+    const before = vi.mocked(folderForgeRemote).mock.calls.length
+
+    await user.click(await screen.findByRole("button", { name: "New issue" }))
+    await user.type(screen.getByLabelText("Title"), "Login times out")
+    await user.click(screen.getByRole("button", { name: "Create issue" }))
+
+    // Re-resolved — which is what tears the stale rows, panel and dialogs
+    // down with it. Merely toasting would leave every later action aimed at
+    // the same repository the refusal was about.
+    await waitFor(() =>
+      expect(vi.mocked(folderForgeRemote).mock.calls.length).toBeGreaterThan(
+        before
+      )
+    )
   })
 
   it("counts the issue it filed onto the tab badge", async () => {

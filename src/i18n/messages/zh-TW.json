@@ -5777,6 +5777,7 @@
     "previewEmpty": "（無描述）",
     "duplicateBody": "已有一個進行中的任務在處理該條目：{title}（{status}）。仍要再建一個嗎？",
     "folderMismatch": "目前資料夾的遠端是 {remote}，與該 Issue 的儲存庫不一致——請選擇相符的資料夾。",
+    "writeMismatch": "這個面板顯示的是 {expected}，但該資料夾的遠端現在是 {actual} —— 寫入已被拒絕，而不是送到錯誤的儲存庫。面板已重新整理，請重試。",
     "cancel": "取消",
     "create": "建立待辦任務",
     "creating": "建立中…",

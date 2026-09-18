@@ -5777,6 +5777,7 @@
     "previewEmpty": "(keine Beschreibung)",
     "duplicateBody": "Eine aktive Aufgabe bearbeitet dieses Element bereits: {title} ({status}). Trotzdem eine weitere erstellen?",
     "folderMismatch": "Das Remote dieses Ordners ist {remote}, nicht das Repository dieses Issues — wähle den passenden Ordner.",
+    "writeMismatch": "Dieses Panel zeigte {expected}, aber das Remote des Ordners ist jetzt {actual} — der Schreibvorgang wurde abgelehnt statt an das falsche Repository gesendet. Das Panel wurde neu geladen; bitte erneut versuchen.",
     "cancel": "Abbrechen",
     "create": "Aufgabe erstellen",
     "creating": "Erstelle…",

@@ -74,6 +74,7 @@ import { ForgeStartDialog } from "@/components/forge/forge-start-dialog"
 import { useIsMobile } from "@/hooks/use-mobile"
 import {
   folderForgeRemote,
+  forgeExpectedRepo,
   forgeListIssues,
   forgeListLabels,
   forgeRemoteGet,
@@ -738,6 +739,18 @@ export function ForgePage() {
     }
   }, [effectiveFolderPath])
 
+  /**
+   * A write came back REFUSED because the folder now reads another repository.
+   *
+   * Re-resolve: the rows, the counts, the panel and the trigger dialog all
+   * belong to a repository this page is no longer showing, and the resolution
+   * effect's teardown is what puts them away. The message itself is shown by
+   * whoever caught the refusal — the panel that raised it is about to unmount.
+   */
+  const handleStaleRepository = useCallback(() => {
+    setRemoteVersion((v) => v + 1)
+  }, [])
+
   // Switching the remote saves the choice on the folder, then re-runs the
   // resolution above: the rows on screen belong to the repository the backend
   // would read next, so the old ones must not survive the switch.
@@ -792,6 +805,16 @@ export function ForgePage() {
    */
   const repoKey =
     readable == null ? "none" : `${readable.server_host}/${readable.owner_repo}`
+
+  /**
+   * What every WRITE carries: the repository this panel is SHOWING.
+   *
+   * Built from the RESOLVED remote rather than from `repoKey`, though the two
+   * name the same repository — the backend compares this pair against what it
+   * derives, and splitting the key back apart would put a parser between two
+   * spellings of one fact.
+   */
+  const expectedRepo = useMemo(() => forgeExpectedRepo(readable), [readable])
 
   /**
    * The switch claims a generation of its own.
@@ -1861,6 +1884,8 @@ export function ForgePage() {
         // tell the panel whether its answer is still about the repository on
         // screen. Same spelling as the scopes above, from the same value.
         repo={repoKey}
+        expected={expectedRepo}
+        onStaleRepository={handleStaleRepository}
         onOpenChange={(open) => {
           if (!open) setDetailRow(null)
         }}
@@ -1880,6 +1905,8 @@ export function ForgePage() {
           // repository — one read serves both, and the dialog must not wait on
           // a round trip to draw.
           labelOptions={labelOptions}
+          expected={expectedRepo}
+          onStaleRepository={handleStaleRepository}
           onOpenChange={setNewIssueOpen}
           onCreated={(created) => {
             setNewIssueOpen(false)

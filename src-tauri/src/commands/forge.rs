@@ -480,6 +480,16 @@ fn redact_userinfo(url: &str) -> String {
     }
 }
 
+/// The folder's repository, or the configuration error every caller wants.
+async fn folder_forge_remote_required(
+    db: &AppDatabase,
+    folder_id: i32,
+) -> Result<ForgeRemote, AppCommandError> {
+    folder_forge_remote_core(db, folder_id).await?.ok_or_else(|| {
+        AppCommandError::configuration_missing("this folder has no recognizable forge remote")
+    })
+}
+
 /// Resolve the folder's repository AND the credential to read it with — the
 /// two things every workbench read needs and neither of which the client may
 /// supply.
@@ -488,17 +498,54 @@ async fn resolve_folder_repo(
     folder_id: i32,
     account_id: Option<&str>,
 ) -> Result<(ForgeRemote, forge::ResolvedAuth), AppCommandError> {
-    let remote = folder_forge_remote_core(db, folder_id)
-        .await?
-        .ok_or_else(|| {
-            AppCommandError::configuration_missing(
-                "this folder has no recognizable forge remote",
-            )
-        })?;
+    let remote = folder_forge_remote_required(db, folder_id).await?;
     let auth =
         forge::resolve_forge_auth(&db.conn, remote.provider, &remote.server_host, account_id)
             .await?;
     Ok((remote, auth))
+}
+
+/// Resolve for a WRITE, whose caller also says which repository it believed it
+/// was writing to.
+///
+/// The belief is checked BEFORE the credential is looked up: a stale panel is
+/// told its coordinates are stale — a fact it can act on — rather than about
+/// an account it never asked for. A caller that names no coordinates (an older
+/// client, or one with nothing readable on screen) is resolved exactly as
+/// before, so nothing that worked stops working.
+async fn resolve_folder_repo_for_write(
+    db: &AppDatabase,
+    folder_id: i32,
+    account_id: Option<&str>,
+    expected: Option<(&str, &str)>,
+) -> Result<(ForgeRemote, forge::ResolvedAuth), AppCommandError> {
+    let remote = folder_forge_remote_required(db, folder_id).await?;
+    if let Some((host, repo)) = expected {
+        if remote.server_host != host || !forge::same_repo(&remote.owner_repo, repo) {
+            return Err(write_mismatch(&remote, host, repo));
+        }
+    }
+    let auth =
+        forge::resolve_forge_auth(&db.conn, remote.provider, &remote.server_host, account_id)
+            .await?;
+    Ok((remote, auth))
+}
+
+/// The refusal a stale write gets. Carries the i18n key the panel recognises
+/// so it can re-resolve instead of leaving the reader on a repository the
+/// folder has already left — the same judgement the trigger path makes, in
+/// words that fit a comment, a close or a merge (see the key's own note).
+fn write_mismatch(remote: &ForgeRemote, expected_host: &str, expected_repo: &str) -> AppCommandError {
+    let actual = format!("{}/{}", remote.server_host, remote.owner_repo);
+    let expected = format!("{expected_host}/{expected_repo}");
+    let mut params = std::collections::BTreeMap::new();
+    params.insert("expected".to_string(), expected.clone());
+    params.insert("actual".to_string(), actual.clone());
+    AppCommandError::configuration_invalid(format!(
+        "this panel was showing {expected}, but the folder's remote is now {actual} — the \
+         write was refused rather than sent to the wrong repository"
+    ))
+    .with_i18n(forge::WRITE_MISMATCH_I18N_KEY, params)
 }
 
 pub async fn forge_list_issues_core(
@@ -613,7 +660,9 @@ pub async fn forge_create_comment_core(
     draft: forge::CommentDraft,
 ) -> Result<forge::ForgeComment, AppCommandError> {
     let (kind, number, body) = draft.resolve().map_err(AppCommandError::from)?;
-    let (remote, auth) = resolve_folder_repo(db, folder_id, draft.account_id.as_deref()).await?;
+    let (remote, auth) =
+        resolve_folder_repo_for_write(db, folder_id, draft.account_id.as_deref(), draft.expected.pair())
+            .await?;
     Ok(match remote.provider {
         // No kind: a pull request IS an issue at GitHub, and one endpoint
         // serves both (`/pulls/{n}/comments` is the review-comment collection,
@@ -643,7 +692,13 @@ pub async fn forge_set_item_state_core(
     request: forge::StateChangeRequest,
 ) -> Result<forge::ForgeIssueRow, AppCommandError> {
     let (kind, number, action) = request.resolve().map_err(AppCommandError::from)?;
-    let (remote, auth) = resolve_folder_repo(db, folder_id, request.account_id.as_deref()).await?;
+    let (remote, auth) = resolve_folder_repo_for_write(
+        db,
+        folder_id,
+        request.account_id.as_deref(),
+        request.expected.pair(),
+    )
+    .await?;
     Ok(match remote.provider {
         ForgeProvider::GitHub => {
             forge::github::set_item_state(&auth, &remote.owner_repo, kind, number, action).await?
@@ -668,7 +723,9 @@ pub async fn forge_create_issue_core(
     draft: forge::NewIssueDraft,
 ) -> Result<forge::ForgeIssueRow, AppCommandError> {
     let resolved = draft.resolve().map_err(AppCommandError::from)?;
-    let (remote, auth) = resolve_folder_repo(db, folder_id, draft.account_id.as_deref()).await?;
+    let (remote, auth) =
+        resolve_folder_repo_for_write(db, folder_id, draft.account_id.as_deref(), draft.expected.pair())
+            .await?;
     Ok(match remote.provider {
         ForgeProvider::GitHub => {
             forge::github::create_issue(&auth, &remote.owner_repo, &resolved).await?
@@ -796,7 +853,13 @@ pub async fn forge_merge_change_core(
     request: forge::ChangeMergeRequest,
 ) -> Result<Option<forge::ForgeIssueRow>, AppCommandError> {
     let (number, method, head_sha) = request.resolve().map_err(AppCommandError::from)?;
-    let (remote, auth) = resolve_folder_repo(db, folder_id, request.account_id.as_deref()).await?;
+    let (remote, auth) = resolve_folder_repo_for_write(
+        db,
+        folder_id,
+        request.account_id.as_deref(),
+        request.expected.pair(),
+    )
+    .await?;
     let head_sha = head_sha.as_deref();
     Ok(match remote.provider {
         ForgeProvider::GitHub => {
@@ -1427,6 +1490,73 @@ mod tests {
             .expect("upstream still resolves");
         assert_eq!(remote.remote_name, "upstream");
         assert_eq!(remote.owner_repo, "acme/app");
+    }
+
+    /// The maintainer's two-client scenario: one window changes the folder's
+    /// remote, the other sends a write carrying the coordinates it still has on
+    /// screen. The write must be REFUSED — never redirected into the repository
+    /// the selection now names — and the refusal has to be one the panel can
+    /// recognise (its i18n key) and re-resolve from.
+    #[tokio::test]
+    async fn a_write_with_stale_coordinates_is_refused_not_redirected() {
+        use crate::db::service::folder_service;
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_run(dir.path(), &["init", "-q"]);
+        git_run(dir.path(), &["remote", "add", "origin", "https://github.com/me/app.git"]);
+        git_run(dir.path(), &["remote", "add", "upstream", "https://github.com/acme/app.git"]);
+        let folder = folder_service::add_folder(&db.conn, dir.path().to_str().unwrap())
+            .await
+            .expect("folder row");
+
+        // Window B switches the folder to the parent while window A still
+        // shows the fork; A's write names the fork.
+        crate::forge::remotes::save(&db.conn, folder.id, Some("upstream".into()))
+            .await
+            .expect("switch");
+
+        let refused = resolve_folder_repo_for_write(
+            &db,
+            folder.id,
+            None,
+            Some(("github.com", "me/app")),
+        )
+        .await
+        .expect_err("stale coordinates must be refused");
+        assert!(
+            matches!(
+                refused.code,
+                crate::app_error::AppErrorCode::ConfigurationInvalid
+            ),
+            "{:?}",
+            refused.code
+        );
+        assert_eq!(refused.i18n_key.as_deref(), Some(forge::WRITE_MISMATCH_I18N_KEY));
+        let params = refused.i18n_params.expect("both repositories are named");
+        assert_eq!(params.get("expected").map(String::as_str), Some("github.com/me/app"));
+        assert_eq!(params.get("actual").map(String::as_str), Some("github.com/acme/app"));
+
+        // The coordinates the panel is ACTUALLY showing get past the check, and
+        // stop at the next gate (no account is configured here). That is what
+        // proves the refusal above came from the coordinate check rather than
+        // from the folder failing to resolve at all.
+        let past = resolve_folder_repo_for_write(
+            &db,
+            folder.id,
+            None,
+            Some(("github.com", "acme/app")),
+        )
+        .await
+        .expect_err("no account");
+        assert_eq!(past.i18n_key.as_deref(), Some(forge::NO_ACCOUNT_I18N_KEY));
+
+        // Naming nothing behaves exactly as it did before this check existed:
+        // a build that predates it keeps working.
+        let unnamed = resolve_folder_repo_for_write(&db, folder.id, None, None)
+            .await
+            .expect_err("no account");
+        assert_eq!(unnamed.i18n_key.as_deref(), Some(forge::NO_ACCOUNT_I18N_KEY));
     }
 
     const URL: &str = "https://github.com/acme/app/issues/7";

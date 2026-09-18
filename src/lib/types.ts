@@ -1986,6 +1986,22 @@ export interface ForgeChangedFileList {
   has_next: boolean
 }
 
+/**
+ * Which repository a WRITE believes it is writing to — mirrors
+ * `forge::ExpectedCoordinates`.
+ *
+ * Sent flat beside a write's own fields, checked against what the folder's
+ * remote resolves to at that moment, and refused — never redirected — when the
+ * two disagree. That is what stops a second window or a stale browser tab from
+ * posting, closing, filing or merging into the repository the selection has
+ * since moved to. Absent on a request from a build that predates the check,
+ * which keeps behaving exactly as it did.
+ */
+export interface ForgeExpectedRepo {
+  expectedServerHost: string
+  expectedOwnerRepo: string
+}
+
 /** A folder's `origin` remote parsed into forge coordinates. */
 export interface ForgeRemote {
   /** Which remote this was resolved from — the panel shows it so the active
