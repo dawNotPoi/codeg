@@ -5618,6 +5618,7 @@
   "Forge": {
     "title": "仓库面板",
     "remote": "远端",
+    "remoteDefault": "默认（{name}）",
     "pickFolder": "选择项目文件夹",
     "noRemote": "该文件夹没有可识别的代码托管远端",
     "errors": {

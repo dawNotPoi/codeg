@@ -5618,6 +5618,7 @@
   "Forge": {
     "title": "儲存庫面板",
     "remote": "遠端",
+    "remoteDefault": "預設（{name}）",
     "pickFolder": "選擇專案資料夾",
     "noRemote": "該資料夾沒有可識別的程式碼託管遠端",
     "errors": {

@@ -5618,6 +5618,7 @@
   "Forge": {
     "title": "Panel del repositorio",
     "remote": "Remoto",
+    "remoteDefault": "Predeterminado ({name})",
     "pickFolder": "Elige una carpeta de proyecto",
     "noRemote": "Esta carpeta no tiene un remoto reconocible",
     "errors": {

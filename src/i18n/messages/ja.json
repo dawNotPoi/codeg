@@ -5618,6 +5618,7 @@
   "Forge": {
     "title": "リポジトリパネル",
     "remote": "リモート",
+    "remoteDefault": "デフォルト（{name}）",
     "pickFolder": "プロジェクトフォルダを選択",
     "noRemote": "このフォルダには認識できるリモートがありません",
     "errors": {

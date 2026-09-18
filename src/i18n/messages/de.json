@@ -5618,6 +5618,7 @@
   "Forge": {
     "title": "Repository-Panel",
     "remote": "Remote",
+    "remoteDefault": "Standard ({name})",
     "pickFolder": "Projektordner wählen",
     "noRemote": "Dieser Ordner hat kein erkennbares Forge-Remote",
     "errors": {

@@ -41,6 +41,7 @@ import type {
   ForgeMergeOptions,
   ForgePanelSettings,
   ForgeRemote,
+  ForgeRemoteStore,
   ForgeSettingsStore,
   ForgeSort,
   ForgeStateAction,
@@ -5926,4 +5927,27 @@ export async function forgeSettingsSet(
   settings: ForgePanelSettings | null
 ): Promise<ForgeSettingsStore> {
   return getTransport().call("forge_settings_set", { folderId, settings })
+}
+
+/** Every folder's remote selection at once — what the panel's picker reads.
+ *  Held as the whole store so switching folders costs no round trip, and a
+ *  selection that no longer resolves is still shown for what the folder is set
+ *  to. */
+export async function forgeRemoteGet(): Promise<ForgeRemoteStore> {
+  return getTransport().call("forge_remote_get", {})
+}
+
+/**
+ * Save ONE folder's remote selection and get every folder's back as stored.
+ *
+ * `remote = null` (or a blank name) puts the folder back on the default
+ * remote — the picker's "default (origin)" answer. Its own command rather than
+ * a field on the settings save: the picker writes this on every click, and a
+ * settings save must not be able to take it away.
+ */
+export async function forgeRemoteSet(
+  folderId: number,
+  remote: string | null
+): Promise<ForgeRemoteStore> {
+  return getTransport().call("forge_remote_set", { folderId, remote })
 }

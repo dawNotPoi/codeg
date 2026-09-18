@@ -8,7 +8,6 @@ export const DEFAULT_FORGE_PANEL_SETTINGS: ForgePanelSettings = {
   default_pr_scenario: null,
   writeback_default: true,
   scenario_prompts: {},
-  remote: null,
 }
 
 /**

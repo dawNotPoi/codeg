@@ -76,8 +76,9 @@ import {
   folderForgeRemote,
   forgeListIssues,
   forgeListLabels,
+  forgeRemoteGet,
+  forgeRemoteSet,
   forgeSettingsGet,
-  forgeSettingsSet,
   forgeTabCount,
   gitListRemotes,
   openSettingsWindow,
@@ -99,10 +100,7 @@ import {
   type ForgePageSize,
 } from "@/lib/forge-list-prefs"
 import { pageCount, pageSlots } from "@/lib/forge-pagination"
-import {
-  DEFAULT_FORGE_PANEL_SETTINGS,
-  effectiveForgeSettings,
-} from "@/lib/forge-settings"
+import { effectiveForgeSettings } from "@/lib/forge-settings"
 import { openUrl, subscribe } from "@/lib/platform"
 import { cn } from "@/lib/utils"
 import type {
@@ -111,6 +109,7 @@ import type {
   ForgeLabel,
   ForgeProviderId,
   ForgeRemote,
+  ForgeRemoteStore,
   ForgeSort,
   ForgeTab,
   ForgeSettingsStore,
@@ -134,6 +133,15 @@ const FOLDER_STORAGE_KEY = "forge:folderId"
  *  search: grep and rg classify the whole file as binary and return no
  *  matches, so every symbol in here read as one that does not exist. */
 const LABEL_SCOPE_SEP = String.fromCharCode(0)
+
+/** The remote the panel reads when a folder has no selection — mirrors
+ *  `DEFAULT_FORGE_REMOTE` in `src-tauri/src/commands/forge.rs`. */
+const DEFAULT_REMOTE = "origin"
+
+/** The picker's "no selection" item. MUST NOT be a possible git remote name:
+ *  a space cannot appear in a refname, which is what a remote name is — so this
+ *  can never collide with a real remote the folder happens to have. */
+const REMOTE_DEFAULT_ITEM = " default"
 
 /** Must mirror `NO_ACCOUNT_I18N_KEY` in src-tauri/src/forge/mod.rs. The key —
  *  not the error `code` — is the discriminator: `configuration_missing` is a
@@ -629,6 +637,12 @@ export function ForgePage() {
    *  than as a reason to wait. Held as the whole store rather than as one
    *  folder's resolved values so switching folders costs no round trip. */
   const [settings, setSettings] = useState<ForgeSettingsStore | null>(null)
+  /** Which git remote each folder reads — the picker's own store, held whole
+   *  like the settings above so switching folders costs no round trip. Read
+   *  and written ONLY by the picker: the settings dialog cannot reach it, and
+   *  vice versa. `null` means "not loaded yet, or the read failed", which the
+   *  picker treats as the default rather than as a reason to wait. */
+  const [remoteStore, setRemoteStore] = useState<ForgeRemoteStore | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [labelOptions, setLabelOptions] = useState<ForgeLabel[]>([])
   const [labelsTruncated, setLabelsTruncated] = useState(false)
@@ -724,32 +738,27 @@ export function ForgePage() {
     }
   }, [effectiveFolderPath])
 
-  // Switching the remote persists the choice on the FOLDER scope, then re-runs
-  // the resolution above: the rows on screen belong to the repository the
-  // backend would read next, so the old ones must not survive the switch.
+  // Switching the remote saves the choice on the folder, then re-runs the
+  // resolution above: the rows on screen belong to the repository the backend
+  // would read next, so the old ones must not survive the switch.
+  //
+  // Its OWN store, not the panel settings: that blob is rewritten wholesale by
+  // the settings dialog, and the picker writing into it is what used to detach
+  // the folder from the global row — and what let a later "use global
+  // defaults" save destroy a choice the user had just made. `null` is the
+  // picker's "default" item: no selection, so the folder reads `origin`.
   const handlePickRemote = useCallback(
-    async (name: string) => {
+    async (name: string | null) => {
       if (effectiveFolderId == null) return
       try {
-        // The store may not have landed yet. Reading it here avoids saving a
-        // folder row that would drop the user's standing instructions.
-        const store = settings ?? (await forgeSettingsGet())
-        if (settings == null) setSettings(store)
-        const current = effectiveForgeSettings(store, effectiveFolderId)
-        // Spread the settings in force so every field this picker does NOT
-        // edit survives the save — enumerating them would silently drop a
-        // field added later.
-        const next = await forgeSettingsSet(effectiveFolderId, {
-          ...(current ?? DEFAULT_FORGE_PANEL_SETTINGS),
-          remote: name,
-        })
-        setSettings(next)
+        const next = await forgeRemoteSet(effectiveFolderId, name)
+        setRemoteStore(next)
         setRemoteVersion((v) => v + 1)
       } catch (e) {
         toast.error(toErrorMessage(e))
       }
     },
-    [effectiveFolderId, settings]
+    [effectiveFolderId]
   )
 
   /**
@@ -809,10 +818,15 @@ export function ForgePage() {
   }
 
   /** The folder's selected remote name even when it does not resolve — the
-   *  picker must show what the folder is set to, not only what loaded. */
+   *  picker must show what the folder is SET to, not only what loaded. Read
+   *  from the selection store rather than from the resolution, which reports
+   *  the default as a name whenever nothing was chosen. */
   const selectedRemoteName = useMemo(
-    () => effectiveForgeSettings(settings, effectiveFolderId)?.remote ?? null,
-    [settings, effectiveFolderId]
+    () =>
+      effectiveFolderId == null
+        ? null
+        : (remoteStore?.folders[String(effectiveFolderId)] ?? null),
+    [remoteStore, effectiveFolderId]
   )
 
   /** Which list the rows belong to — see [`LoadedList`]. Carries the remote,
@@ -1069,11 +1083,21 @@ export function ForgePage() {
   // straight back. A failure is silent on purpose — the trigger dialog falls
   // back to the built-in defaults, and a toast about preferences nobody asked
   // for yet would be noise over a page that works.
+  //
+  // The remote selections come along for the same ride and the same reason:
+  // they are the picker's own store, read once, and a failure leaves the
+  // picker on the default rather than blocking a page that reads repositories
+  // perfectly well.
   useEffect(() => {
     let cancelled = false
     forgeSettingsGet()
       .then((s) => {
         if (!cancelled) setSettings(s)
+      })
+      .catch(() => {})
+    forgeRemoteGet()
+      .then((s) => {
+        if (!cancelled) setRemoteStore(s)
       })
       .catch(() => {})
     const open = () => setSettingsOpen(true)
@@ -1550,7 +1574,7 @@ export function ForgePage() {
             onPickFolder={pickFolder}
             remote={remote}
             remotes={remotes}
-            remoteName={remote?.remote_name ?? selectedRemoteName}
+            remoteName={selectedRemoteName}
             onPickRemote={handlePickRemote}
           />
 
@@ -2009,10 +2033,12 @@ function RepoBar({
   remote: ForgeRemote | null
   /** Every remote in the folder — the picker's options. */
   remotes: GitRemote[]
-  /** The selected remote. `remote.remote_name` wins when resolution succeeded,
-   *  since that is what the rows on screen came from. */
+  /** The folder's SAVED selection, or `null` when it is on the default. NOT
+   *  the resolved name: a folder with nothing saved resolves to `origin`, and
+   *  painting that as a picked remote would hide the fact that the folder is
+   *  following the default — and the item that clears a choice. */
   remoteName: string | null
-  onPickRemote: (name: string) => void
+  onPickRemote: (name: string | null) => void
 }) {
   const t = useTranslations("Forge")
 
@@ -2029,7 +2055,12 @@ function RepoBar({
         variant="ghost"
       />
       {remotes.length > 0 ? (
-        <Select value={remoteName ?? undefined} onValueChange={onPickRemote}>
+        <Select
+          value={remoteName ?? REMOTE_DEFAULT_ITEM}
+          onValueChange={(value) =>
+            onPickRemote(value === REMOTE_DEFAULT_ITEM ? null : value)
+          }
+        >
           <SelectTrigger
             size="sm"
             aria-label={t("remote")}
@@ -2039,6 +2070,13 @@ function RepoBar({
             <SelectValue placeholder={t("remote")} />
           </SelectTrigger>
           <SelectContent>
+            {/* The way OFF a choice. Without it a folder that picked a remote
+                could never go back to the default: this store is not editable
+                from the settings dialog, and picking `origin` would save a
+                choice rather than clear one. */}
+            <SelectItem value={REMOTE_DEFAULT_ITEM}>
+              {t("remoteDefault", { name: DEFAULT_REMOTE })}
+            </SelectItem>
             {remotes.map((r) => (
               <SelectItem key={r.name} value={r.name}>
                 {r.name}

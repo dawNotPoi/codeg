@@ -5618,6 +5618,7 @@
   "Forge": {
     "title": "لوحة المستودع",
     "remote": "remote",
+    "remoteDefault": "الافتراضي ({name})",
     "pickFolder": "اختر مجلد مشروع",
     "noRemote": "لا يحتوي هذا المجلد على remote معروف",
     "errors": {
