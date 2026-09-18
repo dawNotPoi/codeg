@@ -1691,6 +1691,11 @@ export interface ForgeSourceMeta {
   head_ref?: string | null
   head_sha?: string | null
   head_repo?: string | null
+  /** The repository the task's work is pushed to when it is not the source —
+   *  the folder's `origin` recorded at trigger time, for the fork workflow
+   *  (the panel reads the parent; the branch codeg writes is the user's own
+   *  copy). Absent = push to the source. */
+  fork_repo?: string | null
   /** URL of the PR created by the delivery acceptance path (P1). */
   result_pr?: string | null
   /** The trigger dialog's write-back answer, frozen at trigger time. Absent on

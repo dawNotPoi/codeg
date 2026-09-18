@@ -422,7 +422,6 @@ pub async fn folder_forge_remote_core(
     db: &AppDatabase,
     folder_id: i32,
 ) -> Result<Option<ForgeRemote>, AppCommandError> {
-    let folder = get_folder_core(db, folder_id).await?;
     // Resolving the selection HERE is what makes every forge operation follow
     // it: `resolve_folder_repo` calls this, so lists, comments, merges and task
     // creation all read the repository the panel is showing.
@@ -433,7 +432,27 @@ pub async fn folder_forge_remote_core(
     let selected = forge::remotes::load_selected(&db.conn, folder_id)
         .await
         .map_err(AppCommandError::db)?;
-    let remote_name = selected.as_deref().unwrap_or(DEFAULT_FORGE_REMOTE);
+    folder_remote_named(
+        db,
+        folder_id,
+        selected.as_deref().unwrap_or(DEFAULT_FORGE_REMOTE),
+    )
+    .await
+}
+
+/// One NAMED remote of a folder, parsed into forge coordinates — the same
+/// mechanics as the selection above, for a remote named outright.
+///
+/// Used for the folder's own `origin`, which is a fact about the working copy
+/// rather than about what the panel is showing: the picker can point the panel
+/// at a parent while the branch codeg can write to stays `origin`. See
+/// `ForgeSourceMeta::fork_repo`.
+async fn folder_remote_named(
+    db: &AppDatabase,
+    folder_id: i32,
+    remote_name: &str,
+) -> Result<Option<ForgeRemote>, AppCommandError> {
+    let folder = get_folder_core(db, folder_id).await?;
     let output = crate::process::tokio_command("git")
         .args(["-C", &folder.path, "remote", "get-url", remote_name])
         .output()
@@ -961,6 +980,59 @@ pub async fn work_task_create_from_forge_core(
         None
     };
 
+    // ── Which repository the WORK will be pushed to ─────────────────────────
+    //
+    // The panel's selection names the repository being READ (the parent, in the
+    // fork workflow: `origin` is the contributor's own copy); the folder's own
+    // `origin` names the one codeg can WRITE to. Both are known only HERE —
+    // delivery runs long after the panel may have moved on, and the remote list
+    // is the folder's mutable state, so the answer is recorded on the task.
+    let origin_repo = folder_remote_named(db, draft.folder_id, DEFAULT_FORGE_REMOTE)
+        .await?
+        // Only a remote on the SAME host is a candidate: the push spends this
+        // task's credential, which belongs to `server_host`.
+        .filter(|remote| remote.server_host == server_host)
+        .map(|remote| remote.owner_repo);
+    let fork_repo = origin_repo
+        .clone()
+        .filter(|repo| !forge::same_repo(repo, &owner_repo));
+
+    // GitLab spells a cross-project merge request with project IDs rather than a
+    // qualified head ref — BOTH ends of it — so they are resolved HERE, while
+    // the user can still be told, and recorded on the task. The fork's id is the
+    // project the merge request is created ON, and it is also how a retry
+    // recognises its own merge request again: the list payload names a foreign
+    // source project by number alone (see `ForgePr::with_resolved_head`). The
+    // target's id goes in the body, because GitLab does not infer it from the
+    // fork's upstream — a create without it lands on the fork itself.
+    let mut fork_project_id = None;
+    let mut owner_project_id = None;
+    if let Some(fork) = fork_repo.as_deref() {
+        if provider == ForgeProvider::GitLab {
+            let resolved = forge::gitlab::resolve_project_id(&auth, fork).await;
+            fork_project_id = Some(gitlab_project_id(
+                resolved,
+                GitLabEnd::Fork,
+                fork,
+                &owner_repo,
+            )?);
+            let resolved = forge::gitlab::resolve_project_id(&auth, &owner_repo).await;
+            owner_project_id = Some(gitlab_project_id(
+                resolved,
+                GitLabEnd::Target,
+                fork,
+                &owner_repo,
+            )?);
+        }
+    }
+
+    // A review whose head is somebody else's fork is deliberately NOT refused
+    // here. Whether this account may write into that fork is a server-side fact
+    // — the author's "allow edits from maintainers", which codeg cannot read up
+    // front — and a gate here would close a channel that works for exactly the
+    // people this panel is for (a maintainer pushing a fix into a contributor's
+    // review). The push decides instead, and its refusal names the way out.
+
     let key = forge::source_key(
         provider.as_str(),
         &server_host,
@@ -995,6 +1067,9 @@ pub async fn work_task_create_from_forge_core(
         // the task is queued cannot silently change what gets worked on.
         head_sha: pull.as_ref().map(|p| p.head_sha.clone()),
         head_repo: pull.as_ref().map(|p| p.head_repo.clone()),
+        fork_repo,
+        fork_project_id,
+        owner_project_id,
         result_pr: None,
         // Always stamped explicitly, both answers: the engine reads it as the
         // user's decision, and an absent field there means "an older row that
@@ -1167,6 +1242,55 @@ fn truncate_chars(input: &str, cap: usize) -> String {
         return input.to_string();
     }
     input.chars().take(cap).collect()
+}
+
+/// Which end of a cross-project merge request a project id is being resolved
+/// for — the two refusals have different things to tell the user.
+///
+/// Both ends are resolved at the TRIGGER, where the user can still choose
+/// something else, because a project the token cannot read (private without
+/// access, renamed, deleted) leaves the delivery nowhere to go: the merge
+/// request is created ON the fork — GitLab resolves `source_branch` in the
+/// project the request is addressed to — and the target is named in its body.
+/// Every coordinate codeg holds is a path, and GitLab names projects by number,
+/// so the two lookups happen here: once, with the target's id recorded on the
+/// task rather than looked up again on a retry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitLabEnd {
+    /// The project the merge request is created ON: this folder's `origin`.
+    Fork,
+    /// The project it is aimed at: the repository the panel was reading.
+    Target,
+}
+
+/// A GitLab project id the delivery cannot do without, or the refusal that says
+/// which half it was for.
+///
+/// Resolved at the trigger, both ends, because that is where the user can still
+/// choose something else — and the target is recorded rather than looked up
+/// later so a retry or a recovered delivery has the pair on the task already.
+fn gitlab_project_id(
+    resolved: Result<i64, forge::ForgeError>,
+    end: GitLabEnd,
+    fork_repo: &str,
+    source_repo: &str,
+) -> Result<i64, AppCommandError> {
+    resolved.map_err(|e| {
+        let message = match end {
+            GitLabEnd::Fork => format!(
+                "this folder's `origin` is {fork_repo}, so this task's work would be delivered as a \
+                 merge request FROM that fork — but codeg could not read that GitLab project ({e}), \
+                 so there would be nowhere to open it. Check that the account can see {fork_repo}, \
+                 or point the panel at a folder whose `origin` IS {source_repo}."
+            ),
+            GitLabEnd::Target => format!(
+                "this task's work would be delivered as a merge request from {fork_repo} into \
+                 {source_repo} — but codeg could not read {source_repo} on GitLab ({e}), so there \
+                 would be nowhere to open it. Refresh the workbench and try again."
+            ),
+        };
+        AppCommandError::invalid_input(message)
+    })
 }
 
 // ── Tauri wrappers (desktop mode) ───────────────────────────────────────────
@@ -1980,6 +2104,9 @@ mod tests {
                 head_ref: None,
                 head_sha: None,
                 head_repo: None,
+                fork_repo: None,
+                fork_project_id: None,
+                owner_project_id: None,
                 result_pr: None,
                 writeback: stored,
             };
@@ -2018,5 +2145,39 @@ mod tests {
             let expect = matches!(s, ForgeScenario::PlanFirst | ForgeScenario::ReviewOnly);
             assert_eq!(s.is_report(), expect, "{s:?}");
         }
+    }
+
+    /// GitLab's cross-project delivery needs the fork's project id, and the id
+    /// is resolved at the TRIGGER: failing there refuses the task while the
+    /// user can still choose something else, instead of after the agent's work
+    /// has nowhere to go. GitHub and Gitea never call this.
+    #[test]
+    fn a_gitlab_end_whose_project_id_cannot_be_read_is_refused_at_trigger() {
+        assert_eq!(
+            gitlab_project_id(Ok(4711), GitLabEnd::Fork, "me/app", "acme/app").expect("resolves"),
+            4711
+        );
+
+        let not_found = || forge::ForgeError::Api {
+            status: 404,
+            message: "404 Project Not Found".into(),
+        };
+        let refusal = gitlab_project_id(Err(not_found()), GitLabEnd::Fork, "me/app", "acme/app")
+            .expect_err("unreadable fork");
+        assert!(refusal.message.contains("me/app"), "{}", refusal.message);
+        assert!(refusal.message.contains("acme/app"), "{}", refusal.message);
+        assert!(
+            refusal.message.contains("404"),
+            "the forge's own reason rides along: {}",
+            refusal.message
+        );
+
+        // The other end says which repository it could not read, because that
+        // is the part the user can act on — the fork is already settled.
+        let refusal =
+            gitlab_project_id(Err(not_found()), GitLabEnd::Target, "me/app", "acme/app")
+                .expect_err("unreadable target");
+        assert!(refusal.message.contains("me/app"), "{}", refusal.message);
+        assert!(refusal.message.contains("acme/app"), "{}", refusal.message);
     }
 }

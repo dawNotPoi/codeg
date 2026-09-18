@@ -462,6 +462,34 @@ pub struct ForgeSourceMeta {
     pub head_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_repo: Option<String>,
+    /// The repository the WORK is pushed to when it is not the source — the
+    /// folder's `origin`, recorded at trigger time whenever the panel was
+    /// pointed at another remote (the fork workflow: the picker selects the
+    /// parent, so the issues are the parent's while the branch codeg can write
+    /// to is the user's own copy).
+    ///
+    /// `None` is "push to the source", which is every task triggered before
+    /// this field existed and every one triggered from a folder that IS the
+    /// source. Read through `delivery_push_repo`, never directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_repo: Option<String>,
+    /// GitLab only: the FORK's project id, resolved at trigger time.
+    ///
+    /// It is the project a cross-project merge request is created ON
+    /// (`POST /projects/{id}/merge_requests` — GitLab resolves `source_branch`
+    /// in the project the request is addressed to), and — because GitLab's list
+    /// payload names a foreign source project by number alone — it is also what
+    /// turns that `project-{id}` placeholder back into a repository when a
+    /// delivery has to recognise its own merge request on a retry. See
+    /// `ForgePr::with_resolved_head`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_project_id: Option<i64>,
+    /// GitLab only: the id of the project the merge request is AIMED at (the
+    /// repository the panel was reading). Recorded because the create has to
+    /// spell it out on a request addressed to the fork — GitLab does not infer
+    /// the target from the fork's upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_project_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_pr: Option<String>,
     /// Whether this task comments its outcome back on the item when it
