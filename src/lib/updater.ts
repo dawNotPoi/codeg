@@ -397,6 +397,11 @@ export function normalizeAppUpdateError(error: unknown): AppUpdateErrorInfo {
   const rawMessage = toErrorMessage(error)
   const normalized = rawMessage.toLowerCase()
 
+  // The server's pre-download writability probe (`check_writable` in
+  // src-tauri/src/update/install.rs, whose test pins this prefix). Checked
+  // first: the message ends in an arbitrary path, which may contain any of the
+  // substrings below. A bare "permission denied" stays an install failure —
+  // only the probe proves the unwritable part is the install location itself.
   if (normalized.startsWith("update target is not writable:")) {
     return { kind: "permission_denied", rawMessage }
   }

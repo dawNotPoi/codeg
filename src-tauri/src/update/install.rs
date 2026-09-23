@@ -230,6 +230,10 @@ fn check_writable(dir: &Path) -> Result<(), AppCommandError> {
             let _ = std::fs::remove_file(&probe);
             Ok(())
         }
+        // Only the message reaches the UI (the update state publishes
+        // `to_string()`, which drops the detail), and the frontend's
+        // `normalizeAppUpdateError` recognizes an installation permission
+        // problem by this exact prefix — reword the two together.
         Err(e) => Err(AppCommandError::permission_denied(format!(
             "Update target is not writable: {}",
             dir.display()
@@ -1108,6 +1112,25 @@ mod tests {
                 assert_eq!(std::fs::read(b.join("mark")).unwrap(), b"B");
             }
         }
+    }
+
+    #[test]
+    fn unwritable_target_error_keeps_the_prefix_the_ui_classifies() {
+        // The frontend tells an installation permission problem apart from a
+        // generic install failure only by this prefix, so rewording it would
+        // silently bring back the "close the app and try again" advice.
+        let dir = tempfile::tempdir().unwrap();
+        // A missing directory fails the probe even when the tests run as
+        // root, which a read-only mode bit would not.
+        let missing = dir.path().join("missing");
+
+        let err = check_writable(&missing).unwrap_err();
+
+        // `to_string()` is exactly what the update state publishes.
+        assert_eq!(
+            err.to_string(),
+            format!("Update target is not writable: {}", missing.display())
+        );
     }
 
     #[test]
