@@ -165,6 +165,24 @@ function liveServerCalls(snapshot: unknown) {
 }
 
 describe("SystemNetworkSettings — update source outage", () => {
+  it("explains a server update blocked by installation permissions", async () => {
+    mockGetProxy.mockResolvedValue({ enabled: false, proxy_url: null })
+    call.mockImplementation(
+      liveServerCalls({
+        seq: 2,
+        status: "error",
+        error: "Update target is not writable: /usr/local/bin",
+      })
+    )
+
+    renderWithIntl()
+
+    expect(
+      await screen.findByText(/Update target is not writable/)
+    ).toHaveTextContent(/administrator privileges/)
+    expect(screen.queryByText(/close the app and try again/)).toBeNull()
+  })
+
   it("loads proxy settings and exposes rollback when the manifest is unreachable", async () => {
     // The release source is down: the update CHECK fails, but the version read
     // and rollback availability come from the local `app_update_status`

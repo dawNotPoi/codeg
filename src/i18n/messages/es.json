@@ -300,6 +300,7 @@
     "rollbackSuccess": "Se revirtió a la versión anterior. Recargando...",
     "rollbackFailed": "Error al revertir. Revisa los registros del servidor.",
     "updateErrors": {
+      "permissionDenied": "No se puede escribir en el destino de la actualización. Actualiza manualmente con permisos de administrador o revisa los permisos de instalación.",
       "sourceUnavailable": "No se puede acceder al origen de actualización. Revisa tu red o proxy e inténtalo de nuevo.",
       "network": "Falló la conexión de red. Revisa tu red o proxy e inténtalo de nuevo.",
       "downloadFailed": "No se pudo descargar el paquete de actualización. Inténtalo más tarde.",

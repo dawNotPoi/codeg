@@ -144,6 +144,7 @@ export type AppUpdateErrorKind =
   | "source_unreachable"
   | "network"
   | "download_failed"
+  | "permission_denied"
   | "install_failed"
   | "unknown"
 
@@ -163,6 +164,7 @@ export type AppUpdateErrorMessageKey =
   | "updateErrors.sourceUnavailable"
   | "updateErrors.network"
   | "updateErrors.downloadFailed"
+  | "updateErrors.permissionDenied"
   | "updateErrors.installFailed"
   | "updateErrors.unknown"
 
@@ -177,6 +179,8 @@ export function appUpdateErrorMessageKey(
       return "updateErrors.network"
     case "download_failed":
       return "updateErrors.downloadFailed"
+    case "permission_denied":
+      return "updateErrors.permissionDenied"
     case "install_failed":
       return "updateErrors.installFailed"
     case "unknown":
@@ -392,6 +396,10 @@ export async function confirmRollbackVersion(
 export function normalizeAppUpdateError(error: unknown): AppUpdateErrorInfo {
   const rawMessage = toErrorMessage(error)
   const normalized = rawMessage.toLowerCase()
+
+  if (normalized.startsWith("update target is not writable:")) {
+    return { kind: "permission_denied", rawMessage }
+  }
 
   if (
     normalized.includes("latest.json") ||

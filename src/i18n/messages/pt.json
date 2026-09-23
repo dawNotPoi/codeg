@@ -300,6 +300,7 @@
     "rollbackSuccess": "Revertido para a versão anterior. Recarregando...",
     "rollbackFailed": "Falha ao reverter. Verifique os registros do servidor.",
     "updateErrors": {
+      "permissionDenied": "Não é possível gravar no destino da atualização. Atualize manualmente com privilégios de administrador ou verifique as permissões da instalação.",
       "sourceUnavailable": "Não foi possível acessar a fonte de atualização. Verifique sua rede ou proxy e tente novamente.",
       "network": "Falha na conexão de rede. Verifique sua rede ou proxy e tente novamente.",
       "downloadFailed": "Falha ao baixar o pacote de atualização. Tente novamente mais tarde.",

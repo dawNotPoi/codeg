@@ -316,11 +316,38 @@ describe("checkAppUpdateInfo", () => {
 })
 
 describe("appUpdateErrorMessageKey", () => {
+  it("identifies an unwritable server update target as a permission error", () => {
+    const { kind } = normalizeAppUpdateError(
+      "Update target is not writable: /usr/local/bin"
+    )
+    expect(kind).toBe("permission_denied")
+    expect(appUpdateErrorMessageKey(kind, "install")).toBe(
+      "updateErrors.permissionDenied"
+    )
+  })
+
+  it("keeps permission failures distinct from network and install failures", () => {
+    expect(
+      normalizeAppUpdateError("Update target is not writable: /mnt/network/bin")
+        .kind
+    ).toBe("permission_denied")
+    expect(
+      normalizeAppUpdateError("Download failed: permission denied").kind
+    ).toBe("download_failed")
+    expect(
+      normalizeAppUpdateError("Permission denied (os error 13)").kind
+    ).toBe("install_failed")
+    expect(normalizeAppUpdateError("Installer failed").kind).toBe(
+      "install_failed"
+    )
+  })
+
   it("maps each classified kind to its own message", () => {
     const kinds = [
       "source_unreachable",
       "network",
       "download_failed",
+      "permission_denied",
       "install_failed",
     ] as const
     const keys = kinds.map((k) => appUpdateErrorMessageKey(k, "check"))

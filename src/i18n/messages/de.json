@@ -300,6 +300,7 @@
     "rollbackSuccess": "Auf die vorherige Version zurückgesetzt. Wird neu geladen...",
     "rollbackFailed": "Zurücksetzen fehlgeschlagen. Prüfe die Serverprotokolle.",
     "updateErrors": {
+      "permissionDenied": "Das Update-Ziel ist nicht beschreibbar. Aktualisiere manuell mit Administratorrechten oder prüfe die Berechtigungen des Installationsverzeichnisses.",
       "sourceUnavailable": "Die Update-Quelle ist nicht erreichbar. Prüfe Netzwerk oder Proxy und versuche es erneut.",
       "network": "Netzwerkverbindung fehlgeschlagen. Prüfe Netzwerk oder Proxy und versuche es erneut.",
       "downloadFailed": "Das Update-Paket konnte nicht heruntergeladen werden. Bitte später erneut versuchen.",

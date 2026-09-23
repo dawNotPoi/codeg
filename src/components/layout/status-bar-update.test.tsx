@@ -243,6 +243,20 @@ describe("StatusBarUpdate — popover", () => {
     expect(startUpdate).toHaveBeenCalled()
   })
 
+  it("shows a permission-specific message for an unwritable update target", async () => {
+    renderWith({
+      available: RELEASE,
+      state: {
+        seq: 7,
+        status: "error",
+        error: "Update target is not writable: /usr/local/bin",
+      },
+    })
+    fireEvent.click(screen.getByRole("button", { name: /New v0\.21\.9/ }))
+
+    expect(await screen.findByText(/administrator privileges/)).toBeVisible()
+  })
+
   it("reports transferred bytes while downloading", async () => {
     renderWith({
       state: {
