@@ -300,7 +300,8 @@
     "rollbackSuccess": "Rolled back to the previous version. Reloading...",
     "rollbackFailed": "Rollback failed. Check the server logs.",
     "updateErrors": {
-      "permissionDenied": "Update target is not writable. Update manually with administrator privileges or check installation permissions.",
+      "permissionDenied": "Cannot write to {path}, so updates can't be installed in place. Update manually with administrator privileges or check installation permissions.",
+      "targetWriteFailed": "Cannot write to {path}, so updates can't be installed in place: {reason}",
       "sourceUnavailable": "Cannot reach the update source. Check your network or proxy and try again.",
       "network": "Network connection failed. Check your network or proxy and try again.",
       "downloadFailed": "Failed to download update package. Please try again later.",
