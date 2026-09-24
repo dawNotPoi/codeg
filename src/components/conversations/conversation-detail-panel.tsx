@@ -1,4 +1,5 @@
 "use client"
+import { resolveVisibleConversationError } from "@/lib/conversation-error"
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
@@ -626,6 +627,27 @@ const ConversationTabView = memo(function ConversationTabView({
     ),
   })
   const { status: connStatus, sessionId: connSessionId } = conn
+  // Historical tabs cannot start ACP while their first detail is loading:
+  // `canAutoConnect` is gated by `awaitingHistoricalSessionId`, and refetches
+  // retain the existing detail. Thus the revision is available at prompt start.
+  // A fetched detail can predate a new prompt. Keep its saved error visible
+  // after cold open, but retire that copy as soon as this view sees a new turn.
+  // Live errors from the new turn still come from conn.error.
+  const [retiredDetailError, setRetiredDetailError] = useState<{
+    conversationId: number
+    revision: number
+  } | null>(null)
+  useEffect(() => {
+    if (connStatus === "prompting" && dbConversationId != null) {
+      setRetiredDetailError({
+        conversationId: dbConversationId,
+        revision: detail?.last_error_revision ?? 0,
+      })
+    }
+    // Capture the revision at the prompt-start edge only. A later detail
+    // fetch can contain a NEW error from another client, which must show.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connStatus, dbConversationId])
   const messageQueue = useMessageQueue()
   const {
     queue: msgQueue,
@@ -2173,7 +2195,14 @@ const ConversationTabView = memo(function ConversationTabView({
       promptCapabilities={conn.promptCapabilities}
       defaultPath={workingDirForConnection}
       agentName={getAgentLabel(selectedAgent)}
-      error={conn.error}
+      error={resolveVisibleConversationError(
+        conn.error,
+        connStatus,
+        detail,
+        retiredDetailError?.conversationId === dbConversationId
+          ? retiredDetailError.revision
+          : null
+      )}
       claudeApiRetry={conn.claudeApiRetry}
       sessionFailures={conn.sessionFailures}
       onSessionFailureAction={

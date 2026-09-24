@@ -2242,6 +2242,9 @@ impl ConnectionManager {
                     // Inheriting (not forcing) keeps an auto-titled sibling
                     // eligible for later backfills.
                     let title_locked = current.title_locked;
+                    let old_error = current.last_error.clone();
+                    let old_error_revision = current.last_error_revision;
+                    let old_error_scope_sequence = current.last_error_scope_sequence;
                     // The sibling keeps the original's sidebar routing (a forked
                     // chat conversation must stay in the Chat group). `Delegate`
                     // is unreachable here — children are never forked from the
@@ -2275,6 +2278,12 @@ impl ConnectionManager {
                         active.title_locked = Set(true);
                     }
                     active.external_id = Set(Some(forked_session_id));
+                    // S2 is a new error scope; S1's diagnostic belongs on the
+                    // preserving sibling below.
+                    active.last_error = Set(None);
+                    active.last_error_connection_id = Set(None);
+                    active.last_error_scope_sequence = Set(0);
+                    active.last_error_revision = Set(old_error_revision + 1);
                     active.updated_at = Set(now);
                     active.update(txn).await?;
 
@@ -2327,6 +2336,10 @@ impl ConnectionManager {
                         deleted_at: Set(None),
                         pinned_at: Set(None),
                         origin_cwd: Set(None),
+                        last_error: Set(old_error),
+                        last_error_connection_id: Set(None),
+                        last_error_scope_sequence: Set(old_error_scope_sequence),
+                        last_error_revision: Set(old_error_revision),
                     };
                     let inserted = sibling.insert(txn).await?;
                     Ok(inserted.id)

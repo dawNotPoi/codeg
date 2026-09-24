@@ -104,6 +104,11 @@ pub struct ConversationDetail {
 #[derive(Debug, Clone, Serialize)]
 pub struct DbConversationDetail {
     pub summary: DbConversationSummary,
+    /// Latest unresolved ACP error, read from the durable conversation row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<crate::acp::session_state::SessionLastError>,
+    /// Monotonic per-row revision for suppressing a cached pre-prompt error.
+    pub last_error_revision: i64,
     pub turns: Vec<MessageTurn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_stats: Option<SessionStats>,

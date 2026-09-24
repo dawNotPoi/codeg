@@ -22,7 +22,7 @@ use crate::acp::delegation::broker::{DelegationBroker, DelegationMatchKey};
 use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
 use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
-use crate::acp::session_state::SessionState;
+use crate::acp::session_state::{SessionLastError, SessionState};
 use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
@@ -39,7 +39,7 @@ use tokio::sync::RwLock;
 /// of times per turn, so 64 slots is comfortable headroom for a sustained
 /// SQLite stall without forcing the dispatcher to block on `send`.
 /// (SessionStarted, TurnComplete, ConversationLinked, NativeSessionTitle,
-/// TranscriptRolledOver, Disconnected, Error.)
+/// TranscriptRolledOver, Prompting, Disconnected, Error.)
 const WORKER_QUEUE_CAPACITY: usize = 64;
 
 /// Whether an event needs to reach the per-connection worker. Mirrors the
@@ -73,6 +73,9 @@ fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
                 status: ConnectionStatus::Disconnected
             }
             | AcpEvent::Error { .. }
+            | AcpEvent::StatusChanged {
+                status: ConnectionStatus::Prompting
+            }
     )
 }
 
@@ -1508,6 +1511,12 @@ mod delegation_registration_tests {
     }
 }
 
+struct LifecycleWork {
+    envelope: Arc<EventEnvelope>,
+    /// Assigned by the single dispatcher before workers can reorder DB writes.
+    scope_sequence: i64,
+}
+
 /// Per-connection worker that owns the cache for one connection and
 /// serializes its DB writes. Multiple connections run in parallel; within a
 /// connection, ordering is preserved by the mpsc FIFO. Decouples the bus
@@ -1519,7 +1528,7 @@ async fn connection_worker_loop(
     db: DatabaseConnection,
     manager: ConnectionManager,
     broker: Option<Arc<DelegationBroker>>,
-    mut rx: mpsc::Receiver<Arc<EventEnvelope>>,
+    mut rx: mpsc::Receiver<LifecycleWork>,
 ) {
     // 1-entry HashMap so we can reuse `handle_terminal_event` (also keeps the
     // existing test surface intact — tests still drive a `&mut HashMap`).
@@ -1535,13 +1544,39 @@ async fn connection_worker_loop(
     // the terminal work; the second one is a no-op so the broker / DB
     // aren't double-touched.
     let mut terminal_dispatched = false;
-    while let Some(envelope_arc) = rx.recv().await {
-        let envelope: &EventEnvelope = envelope_arc.as_ref();
+    while let Some(work) = rx.recv().await {
+        let envelope: &EventEnvelope = work.envelope.as_ref();
         match &envelope.payload {
             AcpEvent::ConversationLinked {
                 conversation_id, ..
             } => {
                 try_cache_link(&mut cache, &manager, &connection_id, *conversation_id).await;
+                // The row is now owned by this connection even if session/load
+                // rejects before StatusChanged(Prompting) can fire.
+                persist_last_error_for_connection(
+                    &db,
+                    &cache,
+                    &manager,
+                    &connection_id,
+                    work.scope_sequence,
+                    None,
+                )
+                .await;
+            }
+            AcpEvent::StatusChanged {
+                status: ConnectionStatus::Prompting,
+            } => {
+                // Prompting begins a new error scope. This worker serializes
+                // the clear after any earlier Error from the same connection.
+                persist_last_error_for_connection(
+                    &db,
+                    &cache,
+                    &manager,
+                    &connection_id,
+                    work.scope_sequence,
+                    None,
+                )
+                .await;
             }
             AcpEvent::StatusChanged {
                 status: ConnectionStatus::Disconnected,
@@ -1560,9 +1595,23 @@ async fn connection_worker_loop(
             AcpEvent::Error {
                 message,
                 code,
+                details,
                 terminal,
                 ..
             } => {
+                persist_last_error_for_connection(
+                    &db,
+                    &cache,
+                    &manager,
+                    &connection_id,
+                    work.scope_sequence,
+                    Some(&SessionLastError {
+                        message: message.clone(),
+                        code: code.clone(),
+                        details: details.clone(),
+                    }),
+                )
+                .await;
                 // Non-terminal Errors (`turn_failure_error_event`,
                 // `session/load` fallback, empty-prompt rejection, SetMode
                 // / SetConfigOption failures) leave the connection alive:
@@ -1607,6 +1656,84 @@ async fn connection_worker_loop(
     }
 }
 
+/// Resolve the stable conversation id before a terminal connection is removed
+/// from the manager, then persist every Error (including non-terminal ones).
+/// The per-connection FIFO keeps Error/Prompting writes in event order.
+async fn persist_last_error_for_connection(
+    db: &DatabaseConnection,
+    cache: &HashMap<String, CachedConn>,
+    manager: &ConnectionManager,
+    connection_id: &str,
+    scope_sequence: i64,
+    error: Option<&SessionLastError>,
+) {
+    let state = if let Some(entry) = cache.get(connection_id) {
+        Some(entry.state.clone())
+    } else {
+        manager.get_state(connection_id).await
+    };
+    let Some(state) = state else {
+        return;
+    };
+    let cid = {
+        let state = state.read().await;
+        cache
+            .get(connection_id)
+            .map(|entry| entry.conversation_id)
+            .or(state.conversation_id)
+    };
+    let Some(cid) = cid else {
+        return;
+    };
+    for attempt in 0..=HANDLE_EVENT_RETRY_BACKOFFS.len() {
+        let result = match error {
+            Some(error) => {
+                // An Error can arrive before the first Prompting event (for
+                // example session/load rejection). Claim in dispatch order,
+                // then write only while this event still owns the scope.
+                match conversation_service::begin_error_scope(
+                    db, cid, connection_id, scope_sequence,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        conversation_service::set_last_error(
+                            db,
+                            cid,
+                            connection_id,
+                            scope_sequence,
+                            error,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            None => {
+                conversation_service::begin_error_scope(
+                    db,
+                    cid,
+                    connection_id,
+                    scope_sequence,
+                )
+                .await
+            }
+        };
+        match result {
+            Ok(()) => return,
+            Err(e) => {
+                if attempt == HANDLE_EVENT_RETRY_BACKOFFS.len() {
+                    tracing::error!(
+                        "[lifecycle][ERROR] persist last_error for conversation {cid}: {e}"
+                    );
+                    return;
+                }
+                tokio::time::sleep(HANDLE_EVENT_RETRY_BACKOFFS[attempt]).await;
+            }
+        }
+    }
+}
+
 /// Subscribe to the in-process bus synchronously and return the dispatcher
 /// loop future. Filters out events the lifecycle worker doesn't care about
 /// (high-frequency ContentDelta / ToolCall / PermissionRequest etc.) and
@@ -1615,7 +1742,7 @@ async fn connection_worker_loop(
 /// connections, workers run independently so a slow SQLite write on one
 /// connection doesn't backpressure the others.
 ///
-/// All forwarded events (the 7 types in `is_lifecycle_relevant`) use
+/// All forwarded events (the types in `is_lifecycle_relevant`) use
 /// blocking `send().await` to guarantee delivery even when the worker
 /// mailbox is full — `SessionStarted` (writes external_id) and
 /// `TurnComplete` (writes terminal status) are correctness-critical and
@@ -1635,10 +1762,20 @@ pub fn lifecycle_subscriber_task(
     let mut rx = bus.subscribe();
     let metrics = Arc::clone(bus.metrics());
     async move {
+        // Persisted maximum prevents sequence reuse after a backend restart.
+        // CodeG's data-root contract assumes one backend process per database.
+        let mut next_scope_sequence =
+            match conversation_service::max_last_error_scope_sequence(&db_conn).await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!("[lifecycle][ERROR] load error scope sequence: {error}");
+                    return;
+                }
+            };
         // connection_id → worker mailbox. Workers are spawned lazily on the
         // connection's first relevant event and torn down after a terminal
         // event by dropping the sender (worker drains its queue and exits).
-        let mut workers: HashMap<String, mpsc::Sender<Arc<EventEnvelope>>> = HashMap::new();
+        let mut workers: HashMap<String, mpsc::Sender<LifecycleWork>> = HashMap::new();
         let mut lag_throttle = LagLogThrottle::new(LAG_LOG_WINDOW);
         loop {
             match rx.recv().await {
@@ -1676,7 +1813,7 @@ pub fn lifecycle_subscriber_task(
 
                     let tx = workers.entry(conn_id.clone()).or_insert_with(|| {
                         let (tx, worker_rx) =
-                            mpsc::channel::<Arc<EventEnvelope>>(WORKER_QUEUE_CAPACITY);
+                            mpsc::channel::<LifecycleWork>(WORKER_QUEUE_CAPACITY);
                         let db_clone = db_conn.clone();
                         let mgr_clone = manager.clone_ref();
                         let broker_clone = broker.clone();
@@ -1696,7 +1833,14 @@ pub fn lifecycle_subscriber_task(
                     // Counts queue-full as back-pressure observation rather
                     // than a drop event — nothing is dropped, the dispatcher
                     // just waits for the worker to make room.
-                    let send_result = match tx.try_send(envelope_arc) {
+                    next_scope_sequence = next_scope_sequence
+                        .checked_add(1)
+                        .expect("lifecycle error scope sequence exhausted");
+                    let work = LifecycleWork {
+                        envelope: envelope_arc,
+                        scope_sequence: next_scope_sequence,
+                    };
+                    let send_result = match tx.try_send(work) {
                         Ok(()) => Ok(()),
                         Err(mpsc::error::TrySendError::Full(env)) => {
                             metrics
@@ -1768,7 +1912,7 @@ pub fn lifecycle_subscriber_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::session_state::SessionState;
+    use crate::acp::session_state::{SessionLastError, SessionState};
     use crate::db::test_helpers;
     use crate::models::agent::AgentType;
     use crate::web::event_bridge::EventEmitter;
@@ -2324,6 +2468,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_persists_nonterminal_error_and_clears_it_on_next_prompt() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/acp-error-worker").await;
+        let conv = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mgr = ConnectionManager::new();
+        mgr.connections.lock().await.insert(
+            "error-worker".into(),
+            fake_connection_with_state("error-worker", Some(conv.id)),
+        );
+        let work = |seq, payload| LifecycleWork {
+            envelope: Arc::new(EventEnvelope {
+                seq,
+                connection_id: "error-worker".into(),
+                payload,
+            }),
+            scope_sequence: seq as i64,
+        };
+        let linked = || AcpEvent::ConversationLinked {
+            conversation_id: conv.id,
+            folder_id: folder,
+            parent_conversation_id: None,
+            parent_tool_use_id: None,
+        };
+        let prompt = || AcpEvent::StatusChanged {
+            status: ConnectionStatus::Prompting,
+        };
+        assert!(is_lifecycle_relevant(&prompt()));
+
+        let (tx, rx) = mpsc::channel(8);
+        let worker = tokio::spawn(connection_worker_loop(
+            "error-worker".into(),
+            db.conn.clone(),
+            mgr.clone_ref(),
+            None,
+            rx,
+        ));
+        tx.send(work(1, linked())).await.unwrap();
+        tx.send(work(2, prompt())).await.unwrap();
+        tx.send(work(
+            3,
+            AcpEvent::Error {
+                message: "rejected prompt".into(),
+                agent_type: "claude_code".into(),
+                code: Some("rejected".into()),
+                details: Some("redacted evidence".into()),
+                terminal: false,
+            },
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        worker.await.unwrap();
+        let (error, revision) = conversation_service::get_last_error(&db.conn, conv.id)
+            .await
+            .unwrap();
+        let error = error.unwrap();
+        assert_eq!(error.message, "rejected prompt");
+        assert_eq!(error.code.as_deref(), Some("rejected"));
+        assert_eq!(error.details, None);
+
+        let (tx, rx) = mpsc::channel(8);
+        let worker = tokio::spawn(connection_worker_loop(
+            "error-worker".into(),
+            db.conn.clone(),
+            mgr.clone_ref(),
+            None,
+            rx,
+        ));
+        tx.send(work(4, linked())).await.unwrap();
+        tx.send(work(5, prompt())).await.unwrap();
+        drop(tx);
+        worker.await.unwrap();
+        let (error, cleared_revision) = conversation_service::get_last_error(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert!(error.is_none());
+        assert!(cleared_revision > revision);
+    }
+
+    #[tokio::test]
+    async fn older_connection_later_prompt_wins_over_delayed_error() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/acp-error-order").await;
+        let conv = conversation_service::create(
+            &db.conn, folder, AgentType::ClaudeCode, None, None,
+        )
+        .await
+        .unwrap();
+        let mgr = ConnectionManager::new();
+        for id in ["older-tab", "newer-tab"] {
+            mgr.connections.lock().await.insert(
+                id.into(),
+                fake_connection_with_state(id, Some(conv.id)),
+            );
+        }
+        let mut cache = HashMap::new();
+        seed_cache(&mut cache, &mgr, "older-tab", conv.id).await;
+        seed_cache(&mut cache, &mgr, "newer-tab", conv.id).await;
+        let stale = SessionLastError {
+            message: "stale".into(),
+            code: None,
+            details: None,
+        };
+        let fresh = SessionLastError {
+            message: "fresh".into(),
+            code: None,
+            details: None,
+        };
+        persist_last_error_for_connection(
+            &db.conn, &cache, &mgr, "older-tab", 1, Some(&stale),
+        )
+        .await;
+        persist_last_error_for_connection(
+            &db.conn, &cache, &mgr, "newer-tab", 2, None,
+        )
+        .await;
+        // A queued old event finishes after the newer tab started its prompt.
+        persist_last_error_for_connection(
+            &db.conn, &cache, &mgr, "older-tab", 1, Some(&stale),
+        )
+        .await;
+        assert!(conversation_service::get_last_error(&db.conn, conv.id)
+            .await
+            .unwrap()
+            .0
+            .is_none());
+
+        // The original tab remains usable and may start a genuinely later turn.
+        persist_last_error_for_connection(
+            &db.conn, &cache, &mgr, "older-tab", 3, None,
+        )
+        .await;
+        persist_last_error_for_connection(
+            &db.conn, &cache, &mgr, "older-tab", 4, Some(&fresh),
+        )
+        .await;
+        // Even an old event from the same connection cannot overwrite scope 4.
+        persist_last_error_for_connection(
+            &db.conn, &cache, &mgr, "older-tab", 1, Some(&stale),
+        )
+        .await;
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, conv.id)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_error_can_persist_after_manager_removes_connection() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/acp-error-terminal").await;
+        let conv = conversation_service::create(
+            &db.conn, folder, AgentType::ClaudeCode, None, None,
+        )
+        .await
+        .unwrap();
+        let mgr = ConnectionManager::new();
+        mgr.connections.lock().await.insert(
+            "terminal-error".into(),
+            fake_connection_with_state("terminal-error", Some(conv.id)),
+        );
+        let mut cache = HashMap::new();
+        seed_cache(&mut cache, &mgr, "terminal-error", conv.id).await;
+        persist_last_error_for_connection(
+            &db.conn, &cache, &mgr, "terminal-error", 1, None,
+        )
+        .await;
+        mgr.connections.lock().await.remove("terminal-error");
+        persist_last_error_for_connection(
+            &db.conn,
+            &cache,
+            &mgr,
+            "terminal-error",
+            2,
+            Some(&SessionLastError {
+                message: "transport failed".into(),
+                code: None,
+                details: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, conv.id)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "transport failed"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_terminal_event_writes_cancelled_when_in_progress() {
         let db = test_helpers::fresh_in_memory_db().await;
         let folder_id = test_helpers::seed_folder(&db, "/tmp/term-cancel").await;
@@ -2613,7 +2963,7 @@ mod tests {
         assert!(!is_lifecycle_relevant(&AcpEvent::StatusChanged {
             status: ConnectionStatus::Connected,
         }));
-        assert!(!is_lifecycle_relevant(&AcpEvent::StatusChanged {
+        assert!(is_lifecycle_relevant(&AcpEvent::StatusChanged {
             status: ConnectionStatus::Prompting,
         }));
         // ToolCall / ToolCallUpdate are NO LONGER worker-relevant: delegation

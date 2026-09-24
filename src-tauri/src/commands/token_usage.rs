@@ -1359,6 +1359,8 @@ mod tests {
                 delegation_call_id: None,
                 origin_cwd: None,
             },
+            last_error: None,
+            last_error_revision: 0,
             turns,
             session_stats: stats,
             transcript_watermark: None,
