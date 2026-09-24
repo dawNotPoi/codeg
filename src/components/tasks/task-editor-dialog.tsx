@@ -366,6 +366,16 @@ function TaskEditorBody({
     const displayText = (composerRef.current?.getText() ?? prompt).trim()
     const enteredTitle = title.trim()
     const hasAttachments = composerRef.current?.hasAttachments() ?? false
+    // The attachment-only title is a generated label. Removing its last
+    // attachment must not turn that label into a meaningless agent instruction.
+    if (
+      briefOrigin === "attachment" &&
+      !titleEdited &&
+      !displayText &&
+      !hasAttachments
+    ) {
+      return setError(t("errorAttachmentMissing"))
+    }
     if (!enteredTitle && !displayText && !hasAttachments) {
       return setError(t("errorBrief"))
     }

@@ -660,7 +660,7 @@ describe("TaskEditorDialog saved brief provenance", () => {
     })
   })
 
-  it("turns the remaining title into a prompt after the only attachment is removed", async () => {
+  it("rejects an untouched attachment-only brief after its only attachment is removed", async () => {
     const user = userEvent.setup()
     const create = renderEditor()
     await user.click(screen.getByRole("button", { name: "Attach image" }))
@@ -672,13 +672,36 @@ describe("TaskEditorDialog saved brief provenance", () => {
     const edit = renderEditor(taskFromDraft(saved))
     await user.click(screen.getByRole("button", { name: "Remove attachments" }))
     await user.click(screen.getByRole("button", { name: "Save" }))
+    expect(edit).not.toHaveBeenCalled()
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Add an attachment or edit the title to use it as an instruction"
+    )
+  })
+
+  it("accepts a title deliberately edited after the only attachment is removed", async () => {
+    const user = userEvent.setup()
+    const create = renderEditor()
+    await user.click(screen.getByRole("button", { name: "Attach image" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
+    const saved = create.mock.calls[0][0]
+
+    cleanup()
+    const edit = renderEditor(taskFromDraft(saved))
+    await user.click(screen.getByRole("button", { name: "Remove attachments" }))
+    await user.clear(screen.getByLabelText("Title"))
+    await user.type(
+      screen.getByLabelText("Title"),
+      "Inspect another screenshot"
+    )
+    await user.click(screen.getByRole("button", { name: "Save" }))
     await waitFor(() => expect(edit).toHaveBeenCalledTimes(1))
     expect(edit.mock.calls[0][0]).toMatchObject({
-      title: "Task with attachment",
+      title: "Inspect another screenshot",
       config: {
         brief_origin: "title",
-        display_text: "Task with attachment",
-        prompt_blocks: [{ type: "text", text: "Task with attachment" }],
+        display_text: "Inspect another screenshot",
+        prompt_blocks: [{ type: "text", text: "Inspect another screenshot" }],
       },
     })
   })
