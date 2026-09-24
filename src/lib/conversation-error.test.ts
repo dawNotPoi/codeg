@@ -20,9 +20,11 @@ describe("persisted conversation error recovery", () => {
     expect(
       resolveVisibleConversationError(null, "connected", old, 3)
     ).toBeNull()
+    // The reducer clears the old live error at prompt start. A live error
+    // observed while prompting therefore belongs to the new turn.
     expect(
-      resolveVisibleConversationError("stale live error", "prompting", old, 3)
-    ).toBeNull()
+      resolveVisibleConversationError("new live failure", "prompting", old, 3)
+    ).toBe("new live failure")
     const fresh = detail(5, "new failure on another client")
     expect(resolveVisibleConversationError(null, "connected", fresh, 3)).toBe(
       "new failure on another client"

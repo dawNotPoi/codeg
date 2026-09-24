@@ -9,8 +9,8 @@ export function resolveVisibleConversationError(
   detail: DbConversationDetail | null,
   retiredRevision: number | null
 ): string | null {
-  if (status === "prompting") return null
   if (liveError) return liveError
+  if (status === "prompting") return null
   if (!detail?.last_error) return null
   if (
     retiredRevision !== null &&
