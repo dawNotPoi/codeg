@@ -399,8 +399,17 @@ fn prune_reaped(draining: &mut DrainingChildren) {
     });
 }
 
+#[derive(Clone)]
+pub(crate) struct ErrorSessionHint {
+    pub agent_type: AgentType,
+    pub session_id: String,
+}
+
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
+    /// Retained until the lifecycle worker drains terminal events. The
+    /// cleanup guard may remove the live connection before Error is handled.
+    error_session_hints: Arc<Mutex<HashMap<String, ErrorSessionHint>>>,
     /// Connections whose teardown was requested but whose child process has
     /// not been reaped yet.
     ///
@@ -505,6 +514,7 @@ impl ConnectionManager {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
+            error_session_hints: Arc::new(Mutex::new(HashMap::new())),
             external_restore_lock: Arc::new(tokio::sync::RwLock::new(())),
             draining: Arc::new(Mutex::new(Vec::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -522,6 +532,7 @@ impl ConnectionManager {
     pub fn clone_ref(&self) -> Self {
         Self {
             connections: self.connections.clone(),
+            error_session_hints: self.error_session_hints.clone(),
             external_restore_lock: self.external_restore_lock.clone(),
             draining: self.draining.clone(),
             spawn_locks: self.spawn_locks.clone(),
@@ -533,6 +544,26 @@ impl ConnectionManager {
             pending_questions: self.pending_questions.clone(),
             pending_plan_approvals: self.pending_plan_approvals.clone(),
         }
+    }
+
+    pub(crate) async fn register_error_session_hint(
+        &self,
+        connection_id: &str,
+        agent_type: AgentType,
+        session_id: String,
+    ) {
+        self.error_session_hints.lock().await.insert(
+            connection_id.to_owned(),
+            ErrorSessionHint { agent_type, session_id },
+        );
+    }
+
+    pub(crate) async fn error_session_hint(&self, connection_id: &str) -> Option<ErrorSessionHint> {
+        self.error_session_hints.lock().await.get(connection_id).cloned()
+    }
+
+    pub(crate) async fn forget_error_session_hint(&self, connection_id: &str) {
+        self.error_session_hints.lock().await.remove(connection_id);
     }
 
     /// Set the delegation injection context exactly once during bootstrap.
@@ -575,6 +606,7 @@ impl ConnectionManager {
     fn with_spawn_handshake_timeout(timeout: Duration) -> Self {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
+            error_session_hints: Arc::new(Mutex::new(HashMap::new())),
             external_restore_lock: Arc::new(tokio::sync::RwLock::new(())),
             draining: Arc::new(Mutex::new(Vec::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -781,7 +813,12 @@ impl ConnectionManager {
         // installs the SessionStarted dedup signal on the state, registers
         // a cleanup hook, and returns the rx half of the signal. Any spawn
         // failure short-circuits before we touch the rx wait.
-        let session_started_rx = spawn_agent_connection(
+        if pending_error_conversation_id.is_some() {
+            if let Some(sid) = session_id.as_ref() {
+                self.register_error_session_hint(&connection_id, agent_type, sid.clone()).await;
+            }
+        }
+        let session_started_rx = match spawn_agent_connection(
             connection_id.clone(),
             agent_type,
             working_dir,
@@ -794,9 +831,14 @@ impl ConnectionManager {
             preferred_config_values,
             self.delegation_snapshot(),
             self.terminal_shell_config.clone(),
-            pending_error_conversation_id,
         )
-        .await?;
+        .await {
+            Ok(rx) => rx,
+            Err(error) => {
+                self.forget_error_session_hint(&connection_id).await;
+                return Err(error);
+            }
+        };
 
         // When dedup is active, hold the lock until the agent's
         // SessionStarted has applied (so external_id is populated for the

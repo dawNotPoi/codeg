@@ -272,6 +272,97 @@ pub async fn resolve_error_conversation_hint(
         .map(|row| row.id))
 }
 
+/// Atomically write an event to whichever live row still owns the agent
+/// session. The connect-time or linked numeric row may have rebound since
+/// this event was emitted.
+pub async fn persist_last_error_for_agent_session(
+    conn: &DatabaseConnection,
+    agent_type: AgentType,
+    session_id: &str,
+    connection_id: &str,
+    scope_sequence: i64,
+    error: Option<&SessionLastError>,
+) -> Result<u64, DbError> {
+    persist_last_error_for_target(
+        conn,
+        LastErrorTarget::AgentSession(agent_type, session_id),
+        connection_id,
+        scope_sequence,
+        error,
+    )
+    .await
+}
+
+/// A session without a minted external id may only write to an unbound row.
+/// If another client has bound the row meanwhile, this event is stale.
+pub async fn persist_last_error_for_unbound_row(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    connection_id: &str,
+    scope_sequence: i64,
+    error: Option<&SessionLastError>,
+) -> Result<u64, DbError> {
+    persist_last_error_for_target(
+        conn,
+        LastErrorTarget::UnboundRow(conversation_id),
+        connection_id,
+        scope_sequence,
+        error,
+    )
+    .await
+}
+
+enum LastErrorTarget<'a> {
+    AgentSession(AgentType, &'a str),
+    UnboundRow(i32),
+}
+
+async fn persist_last_error_for_target(
+    conn: &DatabaseConnection,
+    target: LastErrorTarget<'_>,
+    connection_id: &str,
+    scope_sequence: i64,
+    error: Option<&SessionLastError>,
+) -> Result<u64, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let durable = error.map(|error| SessionLastError {
+        message: error.message.clone(),
+        code: error.code.clone(),
+        details: None,
+    });
+    let encoded = durable
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| DbError::Migration(format!("serialize session error: {e}")))?;
+    let query = conversation::Entity::update_many()
+        .col_expr(conversation::Column::LastError, Expr::value(encoded))
+        .col_expr(
+            conversation::Column::LastErrorConnectionId,
+            Expr::value(connection_id.to_owned()),
+        )
+        .col_expr(
+            conversation::Column::LastErrorScopeSequence,
+            Expr::value(scope_sequence),
+        )
+        .col_expr(
+            conversation::Column::LastErrorRevision,
+            Expr::col(conversation::Column::LastErrorRevision).add(1),
+        )
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(conversation::Column::LastErrorScopeSequence.lte(scope_sequence));
+    let query = match target {
+        LastErrorTarget::AgentSession(agent_type, session_id) => query
+            .filter(conversation::Column::ExternalId.eq(session_id))
+            .filter(conversation::Column::AgentType.eq(agent_type.as_wire().as_ref())),
+        LastErrorTarget::UnboundRow(conversation_id) => query
+            .filter(conversation::Column::Id.eq(conversation_id))
+            .filter(conversation::Column::ExternalId.is_null()),
+    };
+    Ok(query.exec(conn).await?.rows_affected)
+}
+
 pub async fn get_last_error(
     conn: &DatabaseConnection,
     conversation_id: i32,
@@ -935,6 +1026,11 @@ pub async fn bind_external_id(
                 // nothing would ever correct it. Cleared, S2 seeds itself on its
                 // next open.
                 active.model = Set(None);
+                // A previous-session error follows S1 into the preserving row.
+                // S2 must not inherit S1 diagnostics after the split.
+                active.last_error = Set(None);
+                active.last_error_connection_id = Set(None);
+                active.last_error_revision = Set(carried.last_error_revision + 1);
                 active.updated_at = Set(now);
                 active.update(txn).await?;
 
@@ -3582,6 +3678,33 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn unidentified_error_cannot_follow_a_row_bound_by_another_session() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/acp-unidentified-error").await;
+        let row = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap();
+        bind_external_id(&db.conn, row.id, "another-session", &[])
+            .await
+            .unwrap();
+        let changed = persist_last_error_for_unbound_row(
+            &db.conn,
+            row.id,
+            "unidentified-connection",
+            1,
+            Some(&SessionLastError {
+                message: "stale startup error".into(),
+                code: None,
+                details: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed, 0);
+        assert!(get_last_error(&db.conn, row.id).await.unwrap().0.is_none());
     }
 
     #[tokio::test]

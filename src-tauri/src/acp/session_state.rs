@@ -248,10 +248,6 @@ pub struct SessionState {
     // 身份
     pub connection_id: String,
     pub conversation_id: Option<i32>,
-    /// Historical row supplied at connect time, used only to persist errors
-    /// emitted by session/load before the first ConversationLinked event.
-    /// This does not mark the row as linked for prompt/fork behavior.
-    pub pending_error_conversation_id: Option<i32>,
     pub external_id: Option<String>,
     /// Wall-clock instant `external_id` last CHANGED value (SessionStarted
     /// for a new/loaded/forked session). The transcript watcher uses this as
@@ -664,7 +660,6 @@ impl SessionState {
         Self {
             connection_id,
             conversation_id: None,
-            pending_error_conversation_id: None,
             external_id: None,
             external_id_changed_at: None,
             agent_type,
