@@ -5458,6 +5458,8 @@
     "sectionTarget": "Cible",
     "errorTitle": "Le titre est requis",
     "errorPrompt": "La description est requise",
+    "attachmentTaskTitle": "Tâche avec pièce jointe",
+    "errorBrief": "Saisissez un titre ou une description de la tâche",
     "errorFolder": "Choisissez un dossier",
     "save": "Enregistrer",
     "cancel": "Annuler",

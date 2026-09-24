@@ -5458,6 +5458,8 @@
     "sectionTarget": "Destino",
     "errorTitle": "El título es obligatorio",
     "errorPrompt": "La descripción es obligatoria",
+    "attachmentTaskTitle": "Tarea con archivo adjunto",
+    "errorBrief": "Escribe un título o una descripción de la tarea",
     "errorFolder": "Selecciona una carpeta",
     "save": "Guardar",
     "cancel": "Cancelar",

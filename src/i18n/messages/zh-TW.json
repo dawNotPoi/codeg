@@ -5458,6 +5458,8 @@
     "sectionTarget": "目標",
     "errorTitle": "請輸入標題",
     "errorPrompt": "請輸入任務描述",
+    "attachmentTaskTitle": "含附件的任務",
+    "errorBrief": "請輸入標題或任務描述",
     "errorFolder": "請選擇資料夾",
     "save": "儲存",
     "cancel": "取消",
