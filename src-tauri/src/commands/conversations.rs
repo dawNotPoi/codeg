@@ -1496,14 +1496,22 @@ pub async fn get_folder_conversation_core(
                 }
             }
         } else {
-            let _ = conversation_service::renormalize_external_id_alias(
+            match conversation_service::renormalize_external_id_alias(
                 conn,
                 conversation_id,
                 summary.external_id.as_deref(),
                 new_ext_id.clone(),
             )
-            .await;
-            summary.external_id = Some(new_ext_id);
+            .await
+            {
+                Ok(true) => summary.external_id = Some(new_ext_id),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    conversation_id,
+                    error = %error,
+                    "[conversations] could not persist parser session alias"
+                ),
+            }
         }
     }
     summary.message_count = turns.len() as u32;

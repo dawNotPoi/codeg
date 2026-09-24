@@ -32,6 +32,7 @@ use crate::acp::types::{
     ForkResultInfo, PromptCapabilitiesInfo, PromptInputBlock,
 };
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
+use crate::db::entities::conversation_external_alias;
 use crate::db::service::conversation_service;
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
@@ -2317,6 +2318,58 @@ impl ConnectionManager {
                     let old_error = current.last_error.clone();
                     let old_error_revision = current.last_error_revision;
                     let old_error_scope_sequence = current.last_error_scope_sequence;
+                    let original_alias = conversation_external_alias::Entity::find()
+                        .filter(
+                            conversation_external_alias::Column::AgentType
+                                .eq(agent_type_str.clone()),
+                        )
+                        .filter(
+                            conversation_external_alias::Column::Alias
+                                .eq(original_session_id.clone()),
+                        )
+                        .one(txn)
+                        .await?;
+                    let forked_alias = conversation_external_alias::Entity::find()
+                        .filter(
+                            conversation_external_alias::Column::AgentType
+                                .eq(agent_type_str.clone()),
+                        )
+                        .filter(
+                            conversation_external_alias::Column::Alias
+                                .eq(forked_session_id.clone()),
+                        )
+                        .one(txn)
+                        .await?;
+                    let current_is_forked =
+                        current.external_id.as_deref() == Some(forked_session_id.as_str())
+                            || forked_alias
+                                .as_ref()
+                                .is_some_and(|alias| alias.conversation_id == conversation_id);
+                    let current_is_original =
+                        current.external_id.is_none()
+                            || current.external_id.as_deref() == Some(original_session_id.as_str())
+                            || original_alias
+                                .as_ref()
+                                .is_some_and(|alias| alias.conversation_id == conversation_id);
+                    if !current_is_forked && !current_is_original {
+                        return Err(sea_orm::DbErr::Custom(
+                            "fork target no longer owns the original or forked session".into(),
+                        ));
+                    }
+                    // Detail loading may have normalized the ACP UUID to a
+                    // parser branch id. Both spellings identify S1, so the
+                    // sibling keeps the branch id that reads its transcript.
+                    let sibling_external_id = if original_alias
+                        .as_ref()
+                        .is_some_and(|alias| alias.conversation_id == conversation_id)
+                    {
+                        current
+                            .external_id
+                            .clone()
+                            .unwrap_or_else(|| original_session_id.clone())
+                    } else {
+                        original_session_id.clone()
+                    };
                     // The sibling keeps the original's sidebar routing (a forked
                     // chat conversation must stay in the Chat group). `Delegate`
                     // is unreachable here — children are never forked from the
@@ -2349,13 +2402,18 @@ impl ConnectionManager {
                         // still give it its first name.
                         active.title_locked = Set(true);
                     }
-                    active.external_id = Set(Some(forked_session_id));
-                    // S2 is a new error scope; S1's diagnostic belongs on the
-                    // preserving sibling below.
-                    active.last_error = Set(None);
-                    active.last_error_connection_id = Set(None);
-                    active.last_error_scope_sequence = Set(0);
-                    active.last_error_revision = Set(old_error_revision + 1);
+                    if !current_is_forked {
+                        active.external_id = Set(Some(forked_session_id));
+                    }
+                    // If the lifecycle bind already split S1, this row has
+                    // become S2 and may already hold an S2 error. Only the
+                    // first rebind clears S1's diagnostic from this row.
+                    if !current_is_forked {
+                        active.last_error = Set(None);
+                        active.last_error_connection_id = Set(None);
+                        active.last_error_scope_sequence = Set(0);
+                        active.last_error_revision = Set(old_error_revision + 1);
+                    }
                     active.updated_at = Set(now);
                     active.update(txn).await?;
 
@@ -2375,46 +2433,83 @@ impl ConnectionManager {
                     // instead and return ITS id — the caller feeds that straight
                     // into `ForkResultInfo.sibling_conversation_id` and the
                     // sidebar upsert, both of which must name a real row.
-                    if let Some(existing) = conversation::Entity::find()
-                        .filter(conversation::Column::ExternalId.eq(original_session_id.clone()))
-                        .filter(conversation::Column::AgentType.eq(agent_type_str.clone()))
-                        .filter(conversation::Column::Id.ne(conversation_id))
-                        .filter(conversation::Column::DeletedAt.is_null())
-                        .one(txn)
-                        .await?
+                    let existing_id = if let Some(alias) = original_alias
+                        .as_ref()
+                        .filter(|alias| alias.conversation_id != conversation_id)
                     {
-                        return Ok(existing.id);
-                    }
-
-                    // INSERT sibling row preserving pre-fork (S1) history.
-                    // PendingReview because no live agent is attached to S1.
-                    let sibling = conversation::ActiveModel {
-                        id: NotSet,
-                        folder_id: Set(folder_id),
-                        title: Set(clean_title),
-                        title_locked: Set(title_locked),
-                        agent_type: Set(agent_type_str),
-                        status: Set(ConversationStatus::PendingReview),
-                        kind: Set(sibling_kind),
-                        model: Set(None),
-                        git_branch: Set(git_branch),
-                        external_id: Set(Some(original_session_id)),
-                        parent_id: Set(None),
-                        parent_tool_use_id: Set(None),
-                        delegation_call_id: Set(None),
-                        message_count: Set(0),
-                        created_at: Set(now),
-                        updated_at: Set(now),
-                        deleted_at: Set(None),
-                        pinned_at: Set(None),
-                        origin_cwd: Set(None),
-                        last_error: Set(old_error),
-                        last_error_connection_id: Set(None),
-                        last_error_scope_sequence: Set(old_error_scope_sequence),
-                        last_error_revision: Set(old_error_revision),
+                        Some(
+                            conversation::Entity::find_by_id(alias.conversation_id)
+                                .filter(conversation::Column::DeletedAt.is_null())
+                                .one(txn)
+                                .await?
+                                .ok_or_else(|| {
+                                    sea_orm::DbErr::Custom(
+                                        "original session alias points to a deleted row".into(),
+                                    )
+                                })?
+                                .id,
+                        )
+                    } else if original_alias.is_none() {
+                        conversation::Entity::find()
+                            .filter(
+                                conversation::Column::ExternalId.eq(original_session_id.clone()),
+                            )
+                            .filter(conversation::Column::AgentType.eq(agent_type_str.clone()))
+                            .filter(conversation::Column::Id.ne(conversation_id))
+                            .filter(conversation::Column::DeletedAt.is_null())
+                            .one(txn)
+                            .await?
+                            .map(|row| row.id)
+                    } else {
+                        None
                     };
-                    let inserted = sibling.insert(txn).await?;
-                    Ok(inserted.id)
+                    let sibling_id = if let Some(existing_id) = existing_id {
+                        existing_id
+                    } else {
+                        let sibling = conversation::ActiveModel {
+                            id: NotSet,
+                            folder_id: Set(folder_id),
+                            title: Set(clean_title),
+                            title_locked: Set(title_locked),
+                            agent_type: Set(agent_type_str),
+                            status: Set(ConversationStatus::PendingReview),
+                            kind: Set(sibling_kind),
+                            model: Set(None),
+                            git_branch: Set(git_branch),
+                            external_id: Set(Some(sibling_external_id)),
+                            parent_id: Set(None),
+                            parent_tool_use_id: Set(None),
+                            delegation_call_id: Set(None),
+                            message_count: Set(0),
+                            created_at: Set(now),
+                            updated_at: Set(now),
+                            deleted_at: Set(None),
+                            pinned_at: Set(None),
+                            origin_cwd: Set(None),
+                            last_error: Set(old_error),
+                            last_error_connection_id: Set(None),
+                            last_error_scope_sequence: Set(old_error_scope_sequence),
+                            last_error_revision: Set(old_error_revision),
+                        };
+                        sibling.insert(txn).await?.id
+                    };
+                    if !original_alias
+                        .as_ref()
+                        .is_some_and(|alias| alias.conversation_id != conversation_id)
+                    {
+                        conversation_external_alias::Entity::update_many()
+                            .col_expr(
+                                conversation_external_alias::Column::ConversationId,
+                                Expr::value(sibling_id),
+                            )
+                            .filter(
+                                conversation_external_alias::Column::ConversationId
+                                    .eq(conversation_id),
+                            )
+                            .exec(txn)
+                            .await?;
+                    }
+                    Ok(sibling_id)
                 })
             })
             .await
@@ -7665,6 +7760,188 @@ mod tests {
                 .filter(|c| c.external_id.as_deref() == Some("session-S1"))
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_moves_parser_alias_to_preserved_history() {
+        use crate::acp::session_state::SessionLastError;
+        use crate::db::test_helpers;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/fork-alias").await;
+        let active = conversation_service::create(
+            &db.conn, folder, AgentType::Gemini, None, None,
+        )
+        .await
+        .unwrap();
+        conversation_service::bind_external_id(&db.conn, active.id, "acp-uuid", &[])
+            .await
+            .unwrap();
+        conversation_service::renormalize_external_id_alias(
+            &db.conn, active.id, Some("acp-uuid"), "parser-branch".into(),
+        )
+        .await
+        .unwrap();
+
+        let sibling = ConnectionManager::persist_fork_outcome(
+            &db.conn, active.id, "forked-session".into(), "acp-uuid".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, sibling)
+                .await
+                .unwrap()
+                .external_id
+                .as_deref(),
+            Some("parser-branch"),
+            "the parser history id follows the original session"
+        );
+        assert_eq!(
+            conversation_service::persist_last_error_for_agent_session(
+                &db.conn,
+                AgentType::Gemini,
+                "acp-uuid",
+                "old-live",
+                9,
+                Some(&SessionLastError {
+                    message: "late pre-fork error".into(),
+                    code: None,
+                    details: None,
+                }),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, sibling)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "late pre-fork error"
+        );
+        assert!(
+            conversation_service::get_last_error(&db.conn, active.id)
+                .await
+                .unwrap()
+                .0
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_adopts_alias_sibling_when_lifecycle_split_wins() {
+        use crate::acp::session_state::SessionLastError;
+        use crate::db::test_helpers;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/fork-alias-split-first").await;
+        let active = conversation_service::create(
+            &db.conn, folder, AgentType::Gemini, None, None,
+        )
+        .await
+        .unwrap();
+        conversation_service::bind_external_id(&db.conn, active.id, "acp-uuid", &[])
+            .await
+            .unwrap();
+        conversation_service::renormalize_external_id_alias(
+            &db.conn, active.id, Some("acp-uuid"), "parser-branch".into(),
+        )
+        .await
+        .unwrap();
+
+        // SessionStarted can reach the lifecycle worker before the fork
+        // persistence task. It has already split S1 onto a preserving row.
+        let preserved = conversation_service::bind_external_id(
+            &db.conn, active.id, "forked-session", &[],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        conversation_service::renormalize_external_id_alias(
+            &db.conn,
+            active.id,
+            Some("forked-session"),
+            "parser-S2".into(),
+        )
+        .await
+        .unwrap();
+        conversation_service::persist_last_error_for_agent_session(
+            &db.conn,
+            AgentType::Gemini,
+            "forked-session",
+            "new-live",
+            11,
+            Some(&SessionLastError {
+                message: "new fork error".into(),
+                code: None,
+                details: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let adopted = ConnectionManager::persist_fork_outcome(
+            &db.conn, active.id, "forked-session".into(), "acp-uuid".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(adopted, preserved);
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, active.id)
+                .await
+                .unwrap()
+                .external_id
+                .as_deref(),
+            Some("parser-S2"),
+            "fork finalization must preserve an already normalized S2"
+        );
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, preserved)
+                .await
+                .unwrap()
+                .external_id
+                .as_deref(),
+            Some("parser-branch")
+        );
+        assert_eq!(
+            conversation_service::persist_last_error_for_agent_session(
+                &db.conn,
+                AgentType::Gemini,
+                "acp-uuid",
+                "old-live",
+                10,
+                Some(&SessionLastError {
+                    message: "late old error".into(),
+                    code: None,
+                    details: None,
+                }),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, preserved)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "late old error"
+        );
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, active.id)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "new fork error",
+            "late S1 errors and fork finalization must not replace S2's error"
         );
     }
 
