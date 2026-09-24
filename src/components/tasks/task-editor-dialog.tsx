@@ -83,6 +83,26 @@ function isAttachmentOnlyBrief(
   )
 }
 
+function editorBriefOrigin(
+  config: WorkTaskConfig | null | undefined,
+  storedTitle: string | undefined
+): WorkTaskConfig["brief_origin"] | null {
+  if (config?.brief_origin === "title") {
+    return hasGeneratedTitlePrompt(config, storedTitle) ? "title" : null
+  }
+  if (config?.brief_origin === "description") {
+    return storedTitle && storedTitle === briefTitle(config.display_text)
+      ? "description"
+      : null
+  }
+  if (config?.brief_origin === "attachment") {
+    return isAttachmentOnlyBrief(config) ? "attachment" : null
+  }
+  // Legacy image-only tasks and templates stored no provenance, but an empty
+  // body plus only attachment blocks is enough to preserve their prompt.
+  return isAttachmentOnlyBrief(config) ? "attachment" : null
+}
+
 function editorBlocks(
   config: WorkTaskConfig | null | undefined,
   storedTitle: string | undefined
@@ -169,11 +189,7 @@ function TaskEditorBody({
     task?.config,
     task?.title
   )
-  const storedBriefOrigin =
-    task?.config?.brief_origin === "title" && !titlePromptIsGenerated
-      ? null
-      : (task?.config?.brief_origin ??
-        (isAttachmentOnlyBrief(task?.config) ? "attachment" : null))
+  const storedBriefOrigin = editorBriefOrigin(task?.config, task?.title)
   const [title, setTitle] = useState(
     task?.title ?? seededText.split("\n")[0]?.trim().slice(0, 80) ?? ""
   )
@@ -376,7 +392,7 @@ function TaskEditorBody({
       } else {
         draftTitle = enteredTitle
       }
-    } else if (enteredTitle && !autoTitle) {
+    } else if (enteredTitle && (!autoTitle || !hasAttachments)) {
       draftTitle = enteredTitle
       origin = "title"
       fallbackPrompt = enteredTitle
@@ -403,13 +419,7 @@ function TaskEditorBody({
     const cfg = tpl.config
     // Older image-only templates predate provenance. Their empty text and
     // non-text blocks still mean the template's title is a label, not prose.
-    const origin =
-      cfg?.brief_origin === "title"
-        ? hasGeneratedTitlePrompt(cfg, tpl.title)
-          ? "title"
-          : null
-        : (cfg?.brief_origin ??
-          (isAttachmentOnlyBrief(cfg) ? "attachment" : null))
+    const origin = editorBriefOrigin(cfg, tpl.title)
     const text = origin === "title" ? "" : (cfg?.display_text ?? "")
     setBriefOrigin(origin)
     setTitleEdited(false)

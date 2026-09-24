@@ -116,6 +116,15 @@ vi.mock("./task-message-composer", async () => {
           >
             Attach image
           </button>
+          <button
+            type="button"
+            onClick={() => {
+              setAttachmentBlocks([])
+              props.onAttachmentsChange?.(0)
+            }}
+          >
+            Remove attachments
+          </button>
         </>
       )
     }),
@@ -651,6 +660,48 @@ describe("TaskEditorDialog saved brief provenance", () => {
     })
   })
 
+  it("turns the remaining title into a prompt after the only attachment is removed", async () => {
+    const user = userEvent.setup()
+    const create = renderEditor()
+    await user.click(screen.getByRole("button", { name: "Attach image" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
+    const saved = create.mock.calls[0][0]
+
+    cleanup()
+    const edit = renderEditor(taskFromDraft(saved))
+    await user.click(screen.getByRole("button", { name: "Remove attachments" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(edit).toHaveBeenCalledTimes(1))
+    expect(edit.mock.calls[0][0]).toMatchObject({
+      title: "Task with attachment",
+      config: {
+        brief_origin: "title",
+        display_text: "Task with attachment",
+        prompt_blocks: [{ type: "text", text: "Task with attachment" }],
+      },
+    })
+  })
+
+  it("rejects a description-derived task when both the body and its automatic title are cleared", async () => {
+    const user = userEvent.setup()
+    const create = renderEditor()
+    await user.type(screen.getByLabelText("Task description"), "First plan")
+    await user.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
+    const saved = create.mock.calls[0][0]
+
+    cleanup()
+    const edit = renderEditor(taskFromDraft(saved))
+    await user.clear(screen.getByLabelText("Task description"))
+    expect(screen.getByLabelText("Title")).toHaveValue("")
+    await user.click(screen.getByRole("button", { name: "Save" }))
+    expect(edit).not.toHaveBeenCalled()
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Enter a title or task description"
+    )
+  })
+
   it("uses an explicitly changed title as the prompt on an attachment-only task", async () => {
     const user = userEvent.setup()
     const create = renderEditor()
@@ -753,6 +804,56 @@ describe("TaskEditorDialog saved brief provenance", () => {
     expect(edit.mock.calls[0][0].config.prompt_blocks).toEqual([
       { type: "text", text: "Same words" },
     ])
+    expect(edit.mock.calls[0][0].config.brief_origin).toBeUndefined()
+  })
+
+  it("does not replace an externally edited title under a stale description marker", async () => {
+    const user = userEvent.setup()
+    const edit = renderEditor(
+      ranTask({
+        title: "My custom label",
+        config: {
+          prompt_blocks: [{ type: "text", text: "Fix login" }],
+          display_text: "Fix login",
+          brief_origin: "description",
+          config_values: {},
+        },
+      })
+    )
+    await user.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(edit).toHaveBeenCalledTimes(1))
+    expect(edit.mock.calls[0][0]).toMatchObject({
+      title: "My custom label",
+      config: {
+        display_text: "Fix login",
+        prompt_blocks: [{ type: "text", text: "Fix login" }],
+      },
+    })
+    expect(edit.mock.calls[0][0].config.brief_origin).toBeUndefined()
+  })
+
+  it("does not replace an explicit title under a stale attachment marker with body text", async () => {
+    const user = userEvent.setup()
+    const edit = renderEditor(
+      ranTask({
+        title: "My custom label",
+        config: {
+          prompt_blocks: [{ type: "text", text: "Fix login" }],
+          display_text: "Fix login",
+          brief_origin: "attachment",
+          config_values: {},
+        },
+      })
+    )
+    await user.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(edit).toHaveBeenCalledTimes(1))
+    expect(edit.mock.calls[0][0]).toMatchObject({
+      title: "My custom label",
+      config: {
+        display_text: "Fix login",
+        prompt_blocks: [{ type: "text", text: "Fix login" }],
+      },
+    })
     expect(edit.mock.calls[0][0].config.brief_origin).toBeUndefined()
   })
 
