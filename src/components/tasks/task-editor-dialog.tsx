@@ -46,6 +46,53 @@ import type {
   WorkTaskTemplate,
 } from "@/lib/types"
 
+function briefTitle(text: string): string {
+  const firstLine =
+    text
+      .split("\n")
+      .find((line) => line.trim())
+      ?.trim() ?? ""
+  return Array.from(firstLine).slice(0, 80).join("")
+}
+
+// Only a verified generated title block may be hidden on edit. A stale or
+// inconsistent marker must leave real stored prose alone.
+function hasGeneratedTitlePrompt(
+  config: WorkTaskConfig | null | undefined,
+  storedTitle: string | undefined
+): boolean {
+  const firstBlock = config?.prompt_blocks?.[0]
+  return (
+    config?.brief_origin === "title" &&
+    !!storedTitle &&
+    config.display_text === storedTitle &&
+    firstBlock?.type === "text" &&
+    firstBlock.text === storedTitle
+  )
+}
+
+function isAttachmentOnlyBrief(
+  config: WorkTaskConfig | null | undefined
+): boolean {
+  return (
+    !config?.display_text?.trim() &&
+    !!config?.prompt_blocks?.some((block) => block.type !== "text") &&
+    !config.prompt_blocks.some(
+      (block) => block.type === "text" && block.text.trim()
+    )
+  )
+}
+
+function editorBlocks(
+  config: WorkTaskConfig | null | undefined,
+  storedTitle: string | undefined
+) {
+  const blocks = config?.prompt_blocks ?? null
+  return hasGeneratedTitlePrompt(config, storedTitle)
+    ? (blocks?.slice(1) ?? null)
+    : blocks
+}
+
 interface TaskEditorDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -118,10 +165,26 @@ function TaskEditorBody({
   // A create seeded from a chat message: the text becomes the description and
   // its first line (trimmed) the suggested title.
   const seededText = task == null ? (prefillText ?? "") : ""
+  const titlePromptIsGenerated = hasGeneratedTitlePrompt(
+    task?.config,
+    task?.title
+  )
+  const storedBriefOrigin =
+    task?.config?.brief_origin === "title" && !titlePromptIsGenerated
+      ? null
+      : (task?.config?.brief_origin ??
+        (isAttachmentOnlyBrief(task?.config) ? "attachment" : null))
   const [title, setTitle] = useState(
     task?.title ?? seededText.split("\n")[0]?.trim().slice(0, 80) ?? ""
   )
-  const [prompt, setPrompt] = useState(task?.config?.display_text ?? seededText)
+  const [prompt, setPrompt] = useState(
+    titlePromptIsGenerated ? "" : (task?.config?.display_text ?? seededText)
+  )
+  const [briefOrigin, setBriefOrigin] = useState(storedBriefOrigin)
+  const [titleEdited, setTitleEdited] = useState(false)
+  const [attachmentSeedTitle, setAttachmentSeedTitle] = useState(
+    task?.title ?? ""
+  )
   const [folderId, setFolderId] = useState<number | null>(
     task?.folder_id ?? defaultFolderId ?? projectFolders[0]?.id ?? null
   )
@@ -157,8 +220,10 @@ function TaskEditorBody({
   // them. A `key` bump remounts the box to apply a template.
   const [composerSeed, setComposerSeed] = useState(() => ({
     key: 0,
-    text: task?.config?.display_text ?? seededText,
-    blocks: task?.config?.prompt_blocks ?? null,
+    text: titlePromptIsGenerated
+      ? ""
+      : (task?.config?.display_text ?? seededText),
+    blocks: editorBlocks(task?.config, task?.title),
   }))
   // Mirrors the composer's attached-file count, so a brief that is only a
   // screenshot still passes the "say something" gate below.
@@ -224,7 +289,8 @@ function TaskEditorBody({
   // The captured composer + agent state as a `WorkTaskConfig` — the shared
   // payload of both the task draft and a saved template.
   const buildConfig = async (
-    fallbackPrompt?: string
+    fallbackPrompt?: string,
+    origin?: WorkTaskConfig["brief_origin"]
   ): Promise<WorkTaskConfig> => {
     const composerText = (composerRef.current?.getText() ?? prompt).trim()
     // Prose + inline references + attached images, exactly as a chat send
@@ -251,6 +317,7 @@ function TaskEditorBody({
       return {
         prompt_blocks: blocks,
         display_text: displayText,
+        ...(origin ? { brief_origin: origin } : {}),
         agent_type: null,
         mode_id: null,
         config_values: {},
@@ -266,6 +333,7 @@ function TaskEditorBody({
     return {
       prompt_blocks: blocks,
       display_text: displayText,
+      ...(origin ? { brief_origin: origin } : {}),
       agent_type: agentType,
       mode_id,
       config_values,
@@ -292,19 +360,36 @@ function TaskEditorBody({
       return setError(tChat("attachUploadInProgress"))
     }
 
-    const firstLine = displayText
-      .split("\n")
-      .find((line) => line.trim())
-      ?.trim()
-    const derivedTitle = firstLine
-      ? Array.from(firstLine).slice(0, 80).join("")
-      : t("attachmentTaskTitle")
+    // Only a marked, untouched auto title may follow a changed description
+    // or remain a label for an attachment-only brief. Legacy tasks have no
+    // marker, so an identical title/body pair is still treated as explicit.
+    const autoTitle =
+      !titleEdited &&
+      (briefOrigin === "description" || briefOrigin === "attachment")
+    let draftTitle: string
+    let origin: WorkTaskConfig["brief_origin"]
+    let fallbackPrompt: string | undefined
+    if (displayText) {
+      if (!enteredTitle || autoTitle) {
+        draftTitle = briefTitle(displayText)
+        origin = "description"
+      } else {
+        draftTitle = enteredTitle
+      }
+    } else if (enteredTitle && !autoTitle) {
+      draftTitle = enteredTitle
+      origin = "title"
+      fallbackPrompt = enteredTitle
+    } else {
+      draftTitle = enteredTitle || t("attachmentTaskTitle")
+      origin = "attachment"
+    }
     setSaving(true)
     try {
       const draft: WorkTaskDraft = {
         folder_id: folderId,
-        title: enteredTitle || derivedTitle,
-        config: await buildConfig(displayText ? undefined : enteredTitle),
+        title: draftTitle,
+        config: await buildConfig(fallbackPrompt, origin),
       }
       await onSubmit(draft)
     } catch (e) {
@@ -316,13 +401,25 @@ function TaskEditorBody({
 
   const applyTemplate = (tpl: WorkTaskTemplate) => {
     const cfg = tpl.config
-    const text = cfg?.display_text ?? ""
+    // Older image-only templates predate provenance. Their empty text and
+    // non-text blocks still mean the template's title is a label, not prose.
+    const origin =
+      cfg?.brief_origin === "title"
+        ? hasGeneratedTitlePrompt(cfg, tpl.title)
+          ? "title"
+          : null
+        : (cfg?.brief_origin ??
+          (isAttachmentOnlyBrief(cfg) ? "attachment" : null))
+    const text = origin === "title" ? "" : (cfg?.display_text ?? "")
+    setBriefOrigin(origin)
+    setTitleEdited(false)
+    setAttachmentSeedTitle(tpl.title)
     setTitle(tpl.title)
     setPrompt(text)
     setComposerSeed((s) => ({
       key: s.key + 1,
       text,
-      blocks: cfg?.prompt_blocks ?? null,
+      blocks: editorBlocks(cfg, tpl.title),
     }))
     if (cfg?.agent_type != null) {
       setAgentDirty(true)
@@ -391,7 +488,10 @@ function TaskEditorBody({
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 py-3">
         <input
           value={title}
-          onChange={(e) => setTitle(e.target.value)}
+          onChange={(e) => {
+            setTitleEdited(true)
+            setTitle(e.target.value)
+          }}
           placeholder={t("titlePlaceholder")}
           aria-label={t("titleLabel")}
           className="w-full bg-transparent text-lg font-semibold tracking-tight outline-none placeholder:font-normal placeholder:text-muted-foreground/50"
@@ -440,7 +540,15 @@ function TaskEditorBody({
           defaultBlocks={composerSeed.blocks}
           placeholder={t("promptPlaceholder")}
           ariaLabel={t("promptLabel")}
-          onChange={setPrompt}
+          onChange={(text) => {
+            setPrompt(text)
+            if (titleEdited) return
+            if (briefOrigin === "description") {
+              setTitle(briefTitle(text))
+            } else if (briefOrigin === "attachment") {
+              setTitle(briefTitle(text) || attachmentSeedTitle)
+            }
+          }}
           onAttachmentsChange={setAttachmentCount}
           editorClassName="max-h-[14rem] min-h-[6rem]"
           bottomBarExtra={
