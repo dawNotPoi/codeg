@@ -5460,6 +5460,7 @@
     "errorPrompt": "وصف المهمة مطلوب",
     "attachmentTaskTitle": "مهمة مع مرفق",
     "errorBrief": "أدخل عنوانًا أو وصفًا للمهمة",
+    "errorAttachmentMissing": "أضف مرفقًا أو عدّل العنوان لاستخدامه كتعليمات",
     "errorFolder": "اختر مجلدًا",
     "save": "حفظ",
     "cancel": "إلغاء",
