@@ -5303,8 +5303,6 @@ where
         parent_connection_id.to_string(),
         "--socket-path".to_string(),
         injection.socket_path.to_string_lossy().to_string(),
-        "--token".to_string(),
-        token.clone(),
         // Self-cleanup watchdog: codeg-mcp exits when this PID is gone so
         // orphaned companions can't keep the binary file locked across an
         // installer upgrade (Windows) or hold a stale broker connection
@@ -5323,7 +5321,9 @@ where
         args.push("--disabled-agents".to_string());
         args.push(disabled_builtins.join(","));
     }
-    server = server.args(args);
+    server = server.args(args).env(vec![
+        agent_client_protocol::schema::v1::EnvVariable::new("CODEG_MCP_TOKEN", token.clone()),
+    ]);
     servers.push(McpServer::Stdio(server));
     Some(CompanionInjection {
         token,
@@ -26145,6 +26145,43 @@ mod tests {
             injection.tokens.lookup("any-token").await.is_none(),
             "disabled broker must not register a delegate token"
         );
+    }
+
+    #[tokio::test]
+    async fn injected_companion_keeps_capability_token_out_of_process_args() {
+        let injection = test_delegation_injection(
+            Arc::new(TestAllAgentsAvailable) as Arc<dyn AgentAvailabilityLookup>
+        );
+        injection
+            .broker
+            .set_config(crate::acp::delegation::broker::DelegationConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .await;
+
+        let mut servers = Vec::new();
+        let result = inject_codeg_mcp_with_binary_locator(
+            &mut servers,
+            &injection,
+            "parent-conn",
+            std::path::Path::new("/tmp"),
+            false,
+            HostToolsPolicy::Default,
+            || Some(std::path::PathBuf::from("/tmp/codeg-mcp")),
+        )
+        .await
+        .expect("enabled delegation injects a companion");
+
+        let McpServer::Stdio(server) = &servers[0] else {
+            panic!("companion must be a stdio server");
+        };
+        assert!(!server.args.iter().any(|arg| arg == "--token"));
+        assert!(!server.args.iter().any(|arg| arg == &result.token));
+        assert_eq!(server.env.len(), 1);
+        assert_eq!(server.env[0].name, "CODEG_MCP_TOKEN");
+        assert_eq!(server.env[0].value, result.token);
+        assert!(injection.tokens.lookup(&result.token).await.is_some());
     }
 
     // ─── delegate_target_args: enable-toggle filtering ──────────
