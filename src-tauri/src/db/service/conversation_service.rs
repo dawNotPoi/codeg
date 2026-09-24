@@ -390,7 +390,7 @@ async fn persist_last_error_for_target(
 pub async fn get_last_error(
     conn: &DatabaseConnection,
     conversation_id: i32,
-) -> Result<(Option<SessionLastError>, i64), DbError> {
+) -> Result<(Option<SessionLastError>, i64, Option<String>), DbError> {
     let row = conversation::Entity::find_by_id(conversation_id)
         .filter(conversation::Column::DeletedAt.is_null())
         .one(conn)
@@ -403,7 +403,7 @@ pub async fn get_last_error(
                 .map_err(|e| DbError::Migration(format!("decode session error: {e}")))
         })
         .transpose()?;
-    Ok((error, row.last_error_revision))
+    Ok((error, row.last_error_revision, row.last_error_connection_id))
 }
 
 /// Manual rename: set the title AND lock it. Once locked, the per-turn
@@ -3803,7 +3803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_parser_branch_without_alias_keeps_its_known_load_identity() {
+    async fn legacy_parser_branch_without_alias_splits_on_new_gemini_acp_id() {
         use crate::acp::session_state::SessionLastError;
         use sea_orm::sea_query::Expr;
 
@@ -3827,19 +3827,36 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "session/load emits the requested parser id, so no split occurs"
+            "successful session/load emits the requested parser id"
         );
+        let continues = crate::acp::continued_session_ids(AgentType::Gemini, "fresh-acp-id");
         assert!(
-            bind_external_id(
-                &db.conn,
-                row.id,
-                "fresh-acp-id",
-                &["parser-branch".into()],
-            )
+            continues.is_empty(),
+            "built-in agents have no transcript continuation"
+        );
+        let preserved = bind_external_id(&db.conn, row.id, "fresh-acp-id", &continues)
             .await
             .unwrap()
-            .is_none(),
-            "a declared continuation stays on the historical row"
+            .expect("fallback creates a new ACP session and splits the legacy row");
+        assert_eq!(
+            conversation::Entity::find_by_id(preserved)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .external_id
+                .as_deref(),
+            Some("parser-branch")
+        );
+        assert_eq!(
+            conversation::Entity::find_by_id(row.id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .external_id
+                .as_deref(),
+            Some("fresh-acp-id")
         );
         assert_eq!(
             persist_last_error_for_agent_session(
@@ -3858,6 +3875,7 @@ mod tests {
             .unwrap(),
             1
         );
+        assert!(get_last_error(&db.conn, preserved).await.unwrap().0.is_none());
         assert_eq!(
             get_last_error(&db.conn, row.id)
                 .await

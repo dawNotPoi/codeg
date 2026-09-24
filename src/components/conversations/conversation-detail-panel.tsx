@@ -682,9 +682,16 @@ const ConversationTabView = memo(function ConversationTabView({
           ? retiredDetailError.revision
           : null,
     })
-    if (!alert || !persistedConversationErrorAlertTracker.claim(alert.key)) {
+    if (
+      !alert ||
+      !persistedConversationErrorAlertTracker.claim(alert.revisionKey)
+    ) {
       return
     }
+    // The live notifier may already have told this error, including when
+    // its Alert was dismissed. Claim the revision without replacing that row
+    // or resurrecting a dismissed message after reconnect.
+    if (persistedConversationErrorAlertTracker.wasLiveNotified(alert)) return
     // A recovered error is history, not a new event. Put it in the Alerts
     // record without replaying a toast or desktop notification.
     notify({
