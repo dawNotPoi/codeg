@@ -1181,6 +1181,10 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
   it("replays a reopened tab's connect after an older restart returns", async () => {
     await connectOwner()
     h.acpConnect.mockResolvedValue("replacement-conn")
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "replacement-conn",
+      event_seq: 0,
+    })
     emitAcpEvent(latestAttachHandlers(), {
       seq: 1,
       connection_id: "spawned-conn",
@@ -1213,7 +1217,178 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
     })
     expect(restarted).toBe(false)
     expect(h.store!.getConnection(TAB)?.connectionId).toBe("replacement-conn")
-    expect(h.acpConnect).toHaveBeenCalledTimes(2)
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(false)
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("reclaims its confirmed replacement when the same provider reopens later", async () => {
+    await connectOwner()
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    let finishRestart!: (id: string) => void
+    h.acpRestart.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRestart = resolve
+        })
+    )
+    let pendingRestart!: Promise<boolean>
+    act(() => {
+      pendingRestart = h.actions!.restartStalled(TAB)
+    })
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    await act(async () => {
+      finishRestart("replacement-conn")
+      expect(await pendingRestart).toBe(false)
+    })
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    h.acpGetSessionSnapshot.mockResolvedValue({
+      connection_id: "replacement-conn",
+      external_id: "sess-1",
+      status: "connected",
+    })
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "replacement-conn",
+      event_seq: 0,
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("replacement-conn")
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(false)
+    expect(h.acpFindConnectionForConversation).toHaveBeenCalledTimes(1)
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps another provider's discovery of the replacement as a viewer", async () => {
+    await connectOwner()
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    let finishRestart!: (id: string) => void
+    h.acpRestart.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRestart = resolve
+        })
+    )
+    let pendingRestart!: Promise<boolean>
+    act(() => {
+      pendingRestart = h.actions!.restartStalled(TAB)
+    })
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    await act(async () => {
+      finishRestart("replacement-conn")
+      await pendingRestart
+    })
+    cleanup()
+    await mountProvider()
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "replacement-conn",
+      event_seq: 0,
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("replacement-conn")
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(true)
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not transfer restart ownership to a different session on the same key", async () => {
+    await connectOwner()
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    let finishRestart!: (id: string) => void
+    h.acpRestart.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRestart = resolve
+        })
+    )
+    let pendingRestart!: Promise<boolean>
+    act(() => {
+      pendingRestart = h.actions!.restartStalled(TAB)
+    })
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    await act(async () => {
+      finishRestart("replacement-conn")
+      await pendingRestart
+    })
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "replacement-conn",
+      event_seq: 0,
+    })
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "other-session",
+        42
+      )
+    })
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(true)
+    expect(h.acpFindConnectionForConversation).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not reclaim a replacement that has since switched backend sessions", async () => {
+    await connectOwner()
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    let finishRestart!: (id: string) => void
+    h.acpRestart.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRestart = resolve
+        })
+    )
+    let pendingRestart!: Promise<boolean>
+    act(() => {
+      pendingRestart = h.actions!.restartStalled(TAB)
+    })
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    await act(async () => {
+      finishRestart("replacement-conn")
+      await pendingRestart
+    })
+    h.acpGetSessionSnapshot.mockResolvedValue({
+      connection_id: "replacement-conn",
+      external_id: "forked-session",
+      status: "connected",
+    })
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "replacement-conn",
+      event_seq: 0,
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(true)
+    expect(h.acpFindConnectionForConversation).toHaveBeenCalledTimes(2)
   })
 
   it("does not attach when the tab closes during local teardown after restart", async () => {
