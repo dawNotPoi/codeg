@@ -5458,6 +5458,8 @@
     "sectionTarget": "الهدف",
     "errorTitle": "العنوان مطلوب",
     "errorPrompt": "وصف المهمة مطلوب",
+    "attachmentTaskTitle": "مهمة مع مرفق",
+    "errorBrief": "أدخل عنوانًا أو وصفًا للمهمة",
     "errorFolder": "اختر مجلدًا",
     "save": "حفظ",
     "cancel": "إلغاء",

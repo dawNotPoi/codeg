@@ -5458,6 +5458,8 @@
     "sectionTarget": "Ziel",
     "errorTitle": "Titel ist erforderlich",
     "errorPrompt": "Beschreibung ist erforderlich",
+    "attachmentTaskTitle": "Aufgabe mit Anhang",
+    "errorBrief": "Gib einen Titel oder eine Aufgabenbeschreibung ein",
     "errorFolder": "Ordner wählen",
     "save": "Speichern",
     "cancel": "Abbrechen",

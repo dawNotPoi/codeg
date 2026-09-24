@@ -223,13 +223,27 @@ function TaskEditorBody({
 
   // The captured composer + agent state as a `WorkTaskConfig` — the shared
   // payload of both the task draft and a saved template.
-  const buildConfig = async (): Promise<WorkTaskConfig> => {
-    const displayText = (composerRef.current?.getText() ?? prompt).trim()
+  const buildConfig = async (
+    fallbackPrompt?: string
+  ): Promise<WorkTaskConfig> => {
+    const composerText = (composerRef.current?.getText() ?? prompt).trim()
     // Prose + inline references + attached images, exactly as a chat send
     // composes them; the engine replays these blocks when the task launches.
-    const blocks = composerRef.current?.getPromptBlocks() ?? [
-      { type: "text", text: displayText },
-    ]
+    const composerBlocks: WorkTaskConfig["prompt_blocks"] =
+      composerRef.current?.getPromptBlocks() ??
+      (composerText ? [{ type: "text", text: composerText }] : [])
+    // A title-only brief still needs a real work order at launch. Keep any
+    // attachments, but discard empty prose from a blank composer.
+    const displayText = composerText || fallbackPrompt || ""
+    const blocks =
+      !composerText && fallbackPrompt
+        ? [
+            { type: "text" as const, text: fallbackPrompt },
+            ...composerBlocks.filter(
+              (block) => block.type !== "text" || block.text.trim()
+            ),
+          ]
+        : composerBlocks
     // Explicitly null rather than absent when nothing is picked: clearing the
     // choice has to travel, and the save replaces the stored config wholesale.
     const base_branch = baseBranch.trim() || null
@@ -266,10 +280,11 @@ function TaskEditorBody({
   const submit = async () => {
     setError(null)
     const displayText = (composerRef.current?.getText() ?? prompt).trim()
+    const enteredTitle = title.trim()
     const hasAttachments = composerRef.current?.hasAttachments() ?? false
-    if (!title.trim()) return setError(t("errorTitle"))
-    // A brief that is only a screenshot is still a brief.
-    if (!displayText && !hasAttachments) return setError(t("errorPrompt"))
+    if (!enteredTitle && !displayText && !hasAttachments) {
+      return setError(t("errorBrief"))
+    }
     if (folderId == null) return setError(t("errorFolder"))
     // An unsettled upload has no server-side uri yet, so the stored block would
     // carry nothing for the launch to hydrate from.
@@ -277,12 +292,19 @@ function TaskEditorBody({
       return setError(tChat("attachUploadInProgress"))
     }
 
+    const firstLine = displayText
+      .split("\n")
+      .find((line) => line.trim())
+      ?.trim()
+    const derivedTitle = firstLine
+      ? Array.from(firstLine).slice(0, 80).join("")
+      : t("attachmentTaskTitle")
     setSaving(true)
     try {
       const draft: WorkTaskDraft = {
         folder_id: folderId,
-        title: title.trim(),
-        config: await buildConfig(),
+        title: enteredTitle || derivedTitle,
+        config: await buildConfig(displayText ? undefined : enteredTitle),
       }
       await onSubmit(draft)
     } catch (e) {

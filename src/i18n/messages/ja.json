@@ -5458,6 +5458,8 @@
     "sectionTarget": "ターゲット",
     "errorTitle": "タイトルを入力してください",
     "errorPrompt": "タスクの説明を入力してください",
+    "attachmentTaskTitle": "添付ファイル付きのタスク",
+    "errorBrief": "タイトルまたはタスクの説明を入力してください",
     "errorFolder": "フォルダを選択してください",
     "save": "保存",
     "cancel": "キャンセル",

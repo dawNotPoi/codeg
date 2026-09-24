@@ -5458,6 +5458,8 @@
     "sectionTarget": "Target",
     "errorTitle": "Title is required",
     "errorPrompt": "Task description is required",
+    "attachmentTaskTitle": "Task with attachment",
+    "errorBrief": "Enter a title or task description",
     "errorFolder": "Select a folder",
     "save": "Save",
     "cancel": "Cancel",

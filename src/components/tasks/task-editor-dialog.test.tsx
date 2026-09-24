@@ -58,6 +58,7 @@ vi.mock("./task-message-composer", async () => {
     defaultText?: string
     ariaLabel?: string
     onChange?: (text: string) => void
+    onAttachmentsChange?: (count: number) => void
   }
   return {
     TaskMessageComposer: forwardRef(function Stub(
@@ -65,26 +66,50 @@ vi.mock("./task-message-composer", async () => {
       ref: React.Ref<unknown>
     ) {
       const [text, setText] = useState(props.defaultText ?? "")
+      const [hasImage, setHasImage] = useState(false)
       useImperativeHandle(
         ref,
         () => ({
           getText: () => text,
-          getPromptBlocks: () => [{ type: "text", text }],
-          hasAttachments: () => false,
+          getPromptBlocks: () => [
+            ...(text ? [{ type: "text", text }] : []),
+            ...(hasImage
+              ? [
+                  {
+                    type: "image",
+                    data: "aGk=",
+                    mime_type: "image/png",
+                    uri: null,
+                  },
+                ]
+              : []),
+          ],
+          hasAttachments: () => hasImage,
           hasUploadingImage: () => false,
           focus: () => {},
         }),
-        [text]
+        [text, hasImage]
       )
       return (
-        <textarea
-          aria-label={props.ariaLabel}
-          value={text}
-          onChange={(e) => {
-            setText(e.target.value)
-            props.onChange?.(e.target.value)
-          }}
-        />
+        <>
+          <textarea
+            aria-label={props.ariaLabel}
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value)
+              props.onChange?.(e.target.value)
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => {
+              setHasImage(true)
+              props.onAttachmentsChange?.(1)
+            }}
+          >
+            Attach image
+          </button>
+        </>
       )
     }),
   }
@@ -297,5 +322,173 @@ describe("TaskEditorDialog base branch", () => {
     expect(
       screen.queryByRole("button", { name: "Base branch" })
     ).not.toBeInTheDocument()
+  })
+})
+
+describe("TaskEditorDialog one-field briefs", () => {
+  it("uses a title-only brief as the actual agent prompt", async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEditor()
+
+    await user.type(screen.getByLabelText("Title"), "  Fix the login flow  ")
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      title: "Fix the login flow",
+      config: {
+        display_text: "Fix the login flow",
+        prompt_blocks: [{ type: "text", text: "Fix the login flow" }],
+      },
+    })
+  })
+
+  it("derives a short title from the first nonempty body line and keeps the full brief", async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEditor()
+    const body = "\n  Improve onboarding  \nKeep screenshots and references."
+
+    await user.type(screen.getByLabelText("Task description"), body)
+    await user.click(screen.getByRole("button", { name: "Attach image" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      title: "Improve onboarding",
+      config: {
+        display_text: body.trim(),
+        prompt_blocks: [
+          { type: "text", text: body },
+          { type: "image", data: "aGk=", mime_type: "image/png", uri: null },
+        ],
+      },
+    })
+  })
+
+  it("limits a body-derived title to 80 characters", async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEditor()
+
+    await user.type(screen.getByLabelText("Task description"), "A".repeat(90))
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0][0].title).toBe("A".repeat(80))
+  })
+
+  it("adds the title as the prompt while keeping a title-only brief's attachment", async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEditor()
+
+    await user.type(screen.getByLabelText("Title"), "Inspect this screenshot")
+    await user.click(screen.getByRole("button", { name: "Attach image" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      title: "Inspect this screenshot",
+      config: {
+        display_text: "Inspect this screenshot",
+        prompt_blocks: [
+          { type: "text", text: "Inspect this screenshot" },
+          { type: "image", data: "aGk=", mime_type: "image/png", uri: null },
+        ],
+      },
+    })
+  })
+
+  it("gives an attachment-only brief a localized title without adding text", async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEditor()
+
+    await user.click(screen.getByRole("button", { name: "Attach image" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      title: "Task with attachment",
+      config: {
+        display_text: "",
+        prompt_blocks: [
+          { type: "image", data: "aGk=", mime_type: "image/png", uri: null },
+        ],
+      },
+    })
+  })
+
+  it("keeps separately entered title and body without replacing either", async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEditor()
+
+    await user.type(screen.getByLabelText("Title"), "Short board label")
+    await user.type(
+      screen.getByLabelText("Task description"),
+      "Detailed instructions for the agent"
+    )
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      title: "Short board label",
+      config: {
+        display_text: "Detailed instructions for the agent",
+        prompt_blocks: [
+          { type: "text", text: "Detailed instructions for the agent" },
+        ],
+      },
+    })
+  })
+
+  it("rejects a brief with no title, body, or attachment", async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEditor()
+
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Enter a title or task description"
+    )
+  })
+
+  it("normalizes a title-only edit after the old body is cleared", async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEditor(ranTask({ status: "failed" }))
+
+    await user.clear(screen.getByLabelText("Task description"))
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      title: "Polish the feature",
+      config: {
+        display_text: "Polish the feature",
+        prompt_blocks: [{ type: "text", text: "Polish the feature" }],
+      },
+    })
+  })
+
+  it("derives a title when an edited task keeps only its new body", async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEditor(ranTask({ status: "failed" }))
+
+    await user.clear(screen.getByLabelText("Title"))
+    await user.clear(screen.getByLabelText("Task description"))
+    await user.type(
+      screen.getByLabelText("Task description"),
+      "Rewrite the API\nKeep compatibility"
+    )
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      title: "Rewrite the API",
+      config: {
+        display_text: "Rewrite the API\nKeep compatibility",
+        prompt_blocks: [
+          { type: "text", text: "Rewrite the API\nKeep compatibility" },
+        ],
+      },
+    })
   })
 })
