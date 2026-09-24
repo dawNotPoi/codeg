@@ -1026,6 +1026,27 @@ describe("AcpConnectionsProvider AIR async tasks", () => {
 // only), this has to work from EVERY state the icon can show — including the
 // states where the store holds no entry at all.
 describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
+  function attachTrustedReplacement(sessionId: string): Promise<void> {
+    // The sixth argument is internal to restartStalled; the public action
+    // intentionally exposes only ordinary connect parameters.
+    const attach = h.actions!.connect as unknown as (
+      key: string,
+      agent: "claude_code",
+      dir: string,
+      session: string,
+      conversation: number,
+      confirmedId: string
+    ) => Promise<void>
+    return attach(
+      TAB,
+      "claude_code",
+      "/tmp/x",
+      sessionId,
+      42,
+      "replacement-conn"
+    )
+  }
+
   async function connectOwner() {
     h.acpFindConnectionForConversation.mockResolvedValue(null)
     await mountProvider()
@@ -1390,6 +1411,83 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
     expect(h.store!.getConnection(TAB)?.isViewer).toBe(true)
     expect(h.acpFindConnectionForConversation).toHaveBeenCalledTimes(2)
   })
+
+  it("never kills a confirmed replacement when its attach is closed before registration", async () => {
+    await mountProvider()
+    let attaching!: Promise<void>
+    act(() => {
+      attaching = attachTrustedReplacement("sess-1")
+      void h.actions!.disconnect(TAB)
+    })
+    await act(async () => {
+      await attaching
+    })
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith("replacement-conn")
+    expect(h.acpConnect).not.toHaveBeenCalled()
+  })
+
+  it("never kills a confirmed replacement when a different session supersedes its attach", async () => {
+    await mountProvider()
+    let attaching!: Promise<void>
+    act(() => {
+      attaching = attachTrustedReplacement("sess-1")
+      void h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-2", 43)
+    })
+    await act(async () => {
+      await attaching
+      await Promise.resolve()
+    })
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith("replacement-conn")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    { result: "fails", missing: false },
+    { result: "is missing", missing: true },
+  ])(
+    "falls back to a normal connect when late owner reclaim snapshot $result",
+    async ({ missing }) => {
+      await connectOwner()
+      emitAcpEvent(latestAttachHandlers(), {
+        seq: 1,
+        connection_id: "spawned-conn",
+        type: "session_started",
+        session_id: "sess-1",
+      })
+      let finishRestart!: (id: string) => void
+      h.acpRestart.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishRestart = resolve
+          })
+      )
+      let pendingRestart!: Promise<boolean>
+      act(() => {
+        pendingRestart = h.actions!.restartStalled(TAB)
+      })
+      await act(async () => {
+        await h.actions!.disconnect(TAB)
+      })
+      await act(async () => {
+        finishRestart("replacement-conn")
+        await pendingRestart
+      })
+      if (missing) h.acpGetSessionSnapshot.mockResolvedValueOnce(null)
+      else
+        h.acpGetSessionSnapshot.mockRejectedValueOnce(
+          new Error("connection gone")
+        )
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      h.acpConnect.mockResolvedValue("fresh-conn")
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+      })
+      expect(h.store!.getConnection(TAB)?.connectionId).toBe("fresh-conn")
+      expect(h.store!.getConnection(TAB)?.isViewer).toBe(false)
+      expect(h.acpConnect).toHaveBeenCalledTimes(2)
+    }
+  )
 
   it("does not attach when the tab closes during local teardown after restart", async () => {
     await connectOwner()
