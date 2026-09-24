@@ -463,6 +463,24 @@ function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
   )
 }
 
+function sameRestartOwnerIdentity(a: ConnectRequest, b: ConnectRequest) {
+  return (
+    sameConnectRequest(a, b) &&
+    (a.conversationId == null ||
+      b.conversationId == null ||
+      a.conversationId === b.conversationId)
+  )
+}
+
+const RESTART_OWNER_RECLAIM_MS = 30 * 60 * 1000
+const MAX_RESTART_OWNER_RECLAIMS = 32
+
+type RestartOwnerReclaim = {
+  connectionId: string
+  request: ConnectRequest
+  expiresAt: number
+}
+
 // ── Reducer actions ──
 
 type Action =
@@ -3440,6 +3458,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const restartPendingConnectsRef = useRef(
     new Map<string, { generation: number; request: ConnectRequest }>()
   )
+  // A confirmed replacement can outlive the tab that requested it. Only this
+  // provider knows it came from our own restart; a later same-session reopen
+  // may reclaim ownership once. Nothing is shared across browser clients.
+  const restartOwnerReclaimsRef = useRef(new Map<string, RestartOwnerReclaim>())
   const pendingConnectRequestsRef = useRef(new Map<string, ConnectRequest>())
   // Last params `connect()` was called with, per contextKey — kept AFTER the
   // connection is gone (teardown removes the store entry entirely, so a
@@ -6042,6 +6064,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     const restartingKeys = restartingKeysRef.current
     const surfaceGenerations = surfaceGenerationRef.current
     const restartPendingConnects = restartPendingConnectsRef.current
+    const restartOwnerReclaims = restartOwnerReclaimsRef.current
     // Capture the store ref at effect-setup time so the cleanup
     // function doesn't read a moving target (`storeRef.current` is the
     // same object across renders by design, but the lint rule
@@ -6056,6 +6079,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         surfaceGenerations.set(key, (surfaceGenerations.get(key) ?? 0) + 1)
       }
       restartPendingConnects.clear()
+      restartOwnerReclaims.clear()
       // A connection can be routed by several surfaces (see `reverseMapRef`);
       // tear it down at most once, and only if at least one of them OWNS it.
       const alreadyTornDown = new Set<string>()
@@ -6313,6 +6337,37 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       let configuredAgent: AcpAgentStatus | null = null
 
       try {
+        if (!ownedReplacementId) {
+          const reclaim = restartOwnerReclaimsRef.current.get(contextKey)
+          if (reclaim && reclaim.expiresAt <= Date.now()) {
+            restartOwnerReclaimsRef.current.delete(contextKey)
+          } else if (
+            reclaim &&
+            sessionId &&
+            sameRestartOwnerIdentity(reclaim.request, request)
+          ) {
+            const generation = surfaceGenerationRef.current.get(contextKey) ?? 0
+            // A long-lived process can leave or fork its session after the
+            // original tab closed. Recheck the backend identity before
+            // treating this old local claim as ownership of its current work.
+            const snapshot = await acpGetSessionSnapshot(reclaim.connectionId)
+            if (
+              abandonedKeysRef.current.has(contextKey) ||
+              (surfaceGenerationRef.current.get(contextKey) ?? 0) !== generation
+            ) {
+              return
+            }
+            restartOwnerReclaimsRef.current.delete(contextKey)
+            if (
+              snapshot?.connection_id === reclaim.connectionId &&
+              snapshot.external_id === sessionId &&
+              snapshot.status !== "disconnected" &&
+              snapshot.status !== "error"
+            ) {
+              ownedReplacementId = reclaim.connectionId
+            }
+          }
+        }
         // Preflight: read agent status and block if the SDK / binary is
         // not installed. The session page must never trigger a download
         // or install — if the agent is not ready, prompt the user to
@@ -7142,6 +7197,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       restartingKeysRef.current.add(contextKey)
       const generation = surfaceGenerationRef.current.get(contextKey) ?? 0
       restartGenerationRef.current.set(contextKey, generation)
+      let confirmedReplacementId: string | null = null
+      let restartIdentity: ConnectRequest | null = null
       try {
         const conn = storeRef.current.connections.get(contextKey)
         if (
@@ -7154,6 +7211,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         const request = resolveReconnectRequest(contextKey)
         if (!request?.sessionId) return false
+        restartIdentity = request
         const prefs = getSavedPrefsForConnect(conn.agentType)
         // One backend operation holds the session's dedup lock across teardown,
         // the actual child reap, old lifecycle writes, and session/load.
@@ -7162,6 +7220,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           prefs.modeId,
           prefs.configValues
         )
+        confirmedReplacementId = replacementId
         const current = storeRef.current.connections.get(contextKey)
         if (
           (surfaceGenerationRef.current.get(contextKey) ?? 0) !== generation ||
@@ -7218,6 +7277,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         restartGenerationRef.current.delete(contextKey)
         const pending = restartPendingConnectsRef.current.get(contextKey)
         restartPendingConnectsRef.current.delete(contextKey)
+        const replayOwnedId =
+          pending &&
+          confirmedReplacementId &&
+          restartIdentity &&
+          sameRestartOwnerIdentity(pending.request, restartIdentity)
+            ? confirmedReplacementId
+            : undefined
         if (
           pending &&
           pending.generation ===
@@ -7228,22 +7294,48 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           // A reopened tab must not lose its connect behind the old restart
           // gate. Its normal connect deduplicates against the new backend PID.
           try {
-            await connectRef.current?.(
+            await connect(
               contextKey,
               agentType,
               workingDir,
               sessionId,
-              conversationId
+              conversationId,
+              replayOwnedId
             )
           } catch {
             // connect() publishes the reopened surface's own failure.
           }
+        }
+        if (
+          confirmedReplacementId &&
+          restartIdentity &&
+          !localOwnerKeyOf(confirmedReplacementId)
+        ) {
+          // The old surface closed before it could take ownership. Keep a
+          // bounded, one-use claim for a later same-session reopen in THIS
+          // provider; another browser client has no such trusted record and
+          // continues to discover the connection as a viewer.
+          const claims = restartOwnerReclaimsRef.current
+          const now = Date.now()
+          for (const [key, claim] of claims) {
+            if (claim.expiresAt <= now) claims.delete(key)
+          }
+          claims.delete(contextKey)
+          if (claims.size >= MAX_RESTART_OWNER_RECLAIMS) {
+            claims.delete(claims.keys().next().value!)
+          }
+          claims.set(contextKey, {
+            connectionId: confirmedReplacementId,
+            request: restartIdentity,
+            expiresAt: now + RESTART_OWNER_RECLAIM_MS,
+          })
         }
       }
     },
     [
       connect,
       disconnect,
+      localOwnerKeyOf,
       markConnectionGone,
       resolveReconnectRequest,
       waitForConnectSettled,
@@ -7270,6 +7362,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     const promises: Promise<void>[] = []
     pendingConnectRequestsRef.current.clear()
     restartPendingConnectsRef.current.clear()
+    restartOwnerReclaimsRef.current.clear()
     for (const key of restartingKeysRef.current) {
       surfaceGenerationRef.current.set(
         key,
