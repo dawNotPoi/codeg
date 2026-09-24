@@ -270,6 +270,112 @@ describe("TerminalView recovery", () => {
     view.unmount()
   })
 
+  it("does not attach an old completed canvas PTY while another mount restarts the same ID", async () => {
+    const old = {
+      ...snapshot("old completed output", 3, false),
+      exit_code: 6,
+      generation: "old-generation",
+    }
+    let newProcessStarted = false
+    h.snapshot.mockImplementation(async () =>
+      newProcessStarted ? snapshot("new live output", 1) : old
+    )
+    let finishFirstSpawn!: (id: string) => void
+    h.spawn.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishFirstSpawn = resolve
+        })
+    )
+    h.spawn.mockRejectedValueOnce(new Error("terminal id already exists"))
+    const secondSpawned = vi.fn()
+
+    const first = render(<TerminalView {...props} attach />)
+    await waitFor(() => expect(h.spawn).toHaveBeenCalledTimes(1))
+    const second = render(
+      <TerminalView {...props} attach onSpawned={secondSpawned} />
+    )
+    await waitFor(() => expect(h.spawn).toHaveBeenCalledTimes(2))
+    await waitFor(() =>
+      expect(h.snapshot.mock.calls.length).toBeGreaterThanOrEqual(3)
+    )
+    expect(h.writes.join("")).not.toContain("old completed output")
+    expect(secondSpawned).not.toHaveBeenCalled()
+
+    newProcessStarted = true
+    await act(async () => {
+      finishFirstSpawn("terminal-1")
+    })
+    await waitFor(() =>
+      expect(secondSpawned).toHaveBeenCalledWith("terminal-1")
+    )
+    expect(h.writes.join("")).toContain("new live output")
+    expect(h.writes.join("")).not.toContain("old completed output")
+    first.unmount()
+    second.unmount()
+  })
+
+  it("does not trust an old completed PTY after the competing mount's first snapshot fails", async () => {
+    const old = {
+      ...snapshot("old completed output", 3, false),
+      exit_code: 6,
+      generation: "old-generation",
+    }
+    let probes = 0
+    let newProcessStarted = false
+    h.snapshot.mockImplementation(async () => {
+      probes++
+      if (probes === 2) throw new Error("snapshot temporarily unavailable")
+      return newProcessStarted ? snapshot("new live output", 1) : old
+    })
+    let finishFirstSpawn!: (id: string) => void
+    h.spawn.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishFirstSpawn = resolve
+        })
+    )
+    h.spawn.mockRejectedValueOnce(new Error("terminal id already exists"))
+    const secondSpawned = vi.fn()
+
+    const first = render(<TerminalView {...props} attach />)
+    await waitFor(() => expect(h.spawn).toHaveBeenCalledTimes(1))
+    const second = render(
+      <TerminalView {...props} attach onSpawned={secondSpawned} />
+    )
+    await waitFor(() => expect(h.spawn).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(probes).toBeGreaterThanOrEqual(3))
+    expect(h.writes.join("")).not.toContain("old completed output")
+    expect(secondSpawned).not.toHaveBeenCalled()
+
+    newProcessStarted = true
+    await act(async () => {
+      finishFirstSpawn("terminal-1")
+    })
+    await waitFor(() =>
+      expect(secondSpawned).toHaveBeenCalledWith("terminal-1")
+    )
+    expect(h.writes.join("")).toContain("new live output")
+    expect(h.writes.join("")).not.toContain("old completed output")
+    first.unmount()
+    second.unmount()
+  })
+
+  it("surfaces a canvas launch error instead of resurrecting its old completed PTY", async () => {
+    h.snapshot.mockResolvedValue({
+      ...snapshot("old completed output", 3, false),
+      exit_code: 6,
+      generation: "old-generation",
+    })
+    h.spawn.mockRejectedValueOnce(new Error("shell missing"))
+    const view = render(<TerminalView {...props} attach />)
+    await waitFor(() =>
+      expect(h.writes.join("")).toContain("Failed to start terminal")
+    )
+    expect(h.writes.join("")).not.toContain("old completed output")
+    view.unmount()
+  })
+
   it("accepts a completed winner when duplicate spawn loses after it exits", async () => {
     h.snapshot.mockResolvedValueOnce({
       exists: false,
@@ -290,6 +396,30 @@ describe("TerminalView recovery", () => {
     )
     expect(h.writes.join("")).toContain("short command finished")
     expect(h.writes.join("")).not.toContain("Failed to start terminal")
+    view.unmount()
+  })
+
+  it("accepts a newly completed canvas winner after ignoring the old generation", async () => {
+    const old = {
+      ...snapshot("old completed output", 3, false),
+      exit_code: 6,
+      generation: "old-generation",
+    }
+    const winner = {
+      ...snapshot("new completed output", 2, false),
+      exit_code: 4,
+    }
+    let probes = 0
+    h.snapshot.mockImplementation(async () => (++probes <= 2 ? old : winner))
+    h.spawn.mockRejectedValueOnce(new Error("terminal id already exists"))
+
+    const view = render(<TerminalView {...props} attach />)
+    await waitFor(() =>
+      expect(h.writes.join("")).toContain("Process exited (code 4)")
+    )
+    expect(probes).toBeGreaterThanOrEqual(3)
+    expect(h.writes.join("")).toContain("new completed output")
+    expect(h.writes.join("")).not.toContain("old completed output")
     view.unmount()
   })
 

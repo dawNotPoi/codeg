@@ -105,7 +105,8 @@ describe("a terminal card crossing a route switch", () => {
     const spawnAt = view.indexOf("terminalSpawn(")
     const retryAt = view.indexOf("const retry = attach", spawnAt)
     expect(retryAt).toBeGreaterThan(spawnAt)
-    expect(view).toContain("if (retry?.alive || retry?.exists)")
+    expect(view).toContain("await readSnapshot(duplicateId, isNewProcess)")
+    expect(view).toContain("if (retry && isNewProcess(retry))")
   })
 
   it("keeps buffering across the spawn so a lost race cannot double-print", () => {
@@ -123,7 +124,9 @@ describe("a terminal card crossing a route switch", () => {
     // A restored panel tab has a separate no-spawn branch. Within the canvas
     // spawn branch, output must remain buffered until spawn settles.
     expect(view.slice(spawnBranchAt, spawnAt)).not.toContain("flushReplay(")
-    expect(view.slice(spawnAt)).toContain("if (retry?.alive")
+    const retryAt = view.indexOf("const retry = attach", spawnAt)
+    expect(retryAt).toBeGreaterThan(spawnAt)
+    expect(view.slice(retryAt)).toContain("applySnapshot(retry)")
   })
 
   it("holds a PERMANENT seq floor, because the buffer is not a gate", () => {

@@ -36,7 +36,7 @@ import {
   useOpenUrlTarget,
 } from "@/hooks/use-open-url-target"
 import { detectPlatform } from "@/hooks/use-platform"
-import type { TerminalEvent } from "@/lib/types"
+import type { TerminalEvent, TerminalSnapshot } from "@/lib/types"
 import type { ITerminalAddon, Terminal as XTermTerminal } from "@xterm/xterm"
 
 function computeTerminalFontSize(base: number, zoomLevel: number): number {
@@ -611,12 +611,16 @@ export function TerminalView({
       // A restored tab only knows an ID. A reload can beat a terminal_spawn
       // request still in flight, so probe for a short bounded interval before
       // declaring it unavailable; never replay its original command.
-      const readSnapshot = async (retryMissing: boolean) => {
+      const readSnapshot = async (
+        retryMissing: boolean,
+        accept: (snapshot: TerminalSnapshot) => boolean = (snapshot) =>
+          !!(snapshot.alive || snapshot.exists)
+      ) => {
         const deadline = Date.now() + 10_000
         do {
           const snapshot = await terminalSnapshot(terminalId).catch(() => null)
           if (cancelled) return null
-          if (snapshot?.alive || snapshot?.exists) return snapshot
+          if (snapshot && accept(snapshot)) return snapshot
           if (!retryMissing) return snapshot
           await new Promise((resolve) => setTimeout(resolve, 150))
         } while (!cancelled && Date.now() < deadline)
@@ -625,6 +629,7 @@ export function TerminalView({
 
       let attached = false
       let confirmedMissing = false
+      let previousCompleted: TerminalSnapshot | null = null
       if (attach) {
         const snapshot = await readSnapshot(!spawnOnMissing)
         if (cancelled) {
@@ -633,6 +638,7 @@ export function TerminalView({
         }
         confirmedMissing =
           snapshot != null && !snapshot.alive && !snapshot.exists
+        if (snapshot?.exists && !snapshot.alive) previousCompleted = snapshot
         if (snapshot?.alive || (reuseCompleted && snapshot?.exists)) {
           attached = true
           applySnapshot(snapshot)
@@ -668,12 +674,28 @@ export function TerminalView({
           // openpty/spawn and absent from snapshots. Wait only for that known
           // duplicate race; a genuine launch error should surface promptly.
           const duplicateId = String(err).includes("already exists")
-          const retry = attach ? await readSnapshot(duplicateId) : null
+          // A canvas may have deliberately ignored a completed PTY before
+          // spawning. That old tombstone can remain visible while another
+          // mount is still spawning this ID. A completed retry needs either
+          // a confirmed empty snapshot before spawning or a new generation;
+          // an initial snapshot request failure proves neither.
+          const isNewProcess = (candidate: TerminalSnapshot) =>
+            !!(
+              candidate.alive ||
+              (candidate.exists &&
+                (confirmedMissing ||
+                  (previousCompleted?.generation &&
+                    candidate.generation &&
+                    candidate.generation !== previousCompleted.generation)))
+            )
+          const retry = attach
+            ? await readSnapshot(duplicateId, isNewProcess)
+            : null
           if (cancelled) {
             teardown()
             return
           }
-          if (retry?.alive || retry?.exists) {
+          if (retry && isNewProcess(retry)) {
             attached = true
             applySnapshot(retry)
             onSpawnedRef.current?.(terminalId)
