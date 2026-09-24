@@ -5283,8 +5283,8 @@ where
     // targets; disabled BUILT-INS are subtracted companion-side
     // (`--disabled-agents`) so the embedded schema stays the single source of
     // truth for the builtin list and its order. Either flag is omitted when
-    // empty, which also keeps an older codeg-mcp binary — one that rejects
-    // unknown flags at startup — working for installations needing neither.
+    // empty. The companion must match the parent version: older binaries
+    // require `--token` and cannot read the per-server environment token.
     let (custom_slugs, disabled_builtins) = delegate_target_args(&disabled);
     let token = uuid::Uuid::new_v4().to_string();
     injection
