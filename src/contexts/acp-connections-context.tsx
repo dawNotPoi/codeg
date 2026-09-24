@@ -19,6 +19,7 @@ import { randomUUID } from "@/lib/utils"
 import { inferLiveToolName } from "@/lib/tool-call-normalization"
 import {
   acpConnect,
+  acpRestart,
   acpGetAgentStatus,
   acpPrompt,
   acpSetMode,
@@ -3120,6 +3121,9 @@ export interface AcpActionsValue {
    * have no params for (never connected in this session).
    */
   reconnect(contextKey: string): Promise<boolean>
+  /** Confirmed one-connection restart for the owning client only. Returns
+   * false when the live connection has no resumable session identity. */
+  restartStalled(contextKey: string): Promise<boolean>
   /**
    * The params `reconnect(contextKey)` would use, or `null` when it would be a
    * no-op. Lets the status popover name the agent and enable its button while
@@ -3423,6 +3427,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   // Guard against concurrent connect() calls
   const connectingKeysRef = useRef(new Set<string>())
+  // A confirmed backend restart owns this key until its replacement has
+  // attached locally. Other connect attempts cannot steal its route.
+  const restartingKeysRef = useRef(new Set<string>())
   const pendingConnectRequestsRef = useRef(new Map<string, ConnectRequest>())
   // Last params `connect()` was called with, per contextKey — kept AFTER the
   // connection is gone (teardown removes the store entry entirely, so a
@@ -6226,8 +6233,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       agentType: AgentType,
       workingDir?: string,
       sessionId?: string,
-      conversationId?: number
+      conversationId?: number,
+      ownedReplacementId?: string
     ) => {
+      if (restartingKeysRef.current.has(contextKey) && !ownedReplacementId) {
+        return
+      }
       const request: ConnectRequest = {
         agentType,
         workingDir,
@@ -6282,43 +6293,47 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // of the surface's connection-status heart. It is thrown as an
         // "alerted" error so the catch-all at the bottom doesn't publish a
         // second, vaguer copy of it.
-        try {
-          configuredAgent = await acpGetAgentStatus(agentType)
-        } catch (error) {
-          const reason = t("unableReadAgentConfig", {
-            message: normalizeErrorMessage(error),
-          })
-          publishConnectError({
-            agentType,
-            title: t("connectFailedTitle", { agent: getAgentLabel(agentType) }),
-            detail: reason,
-            opensAgentSettings: true,
-          })
-          throw createAlertedError(reason)
-        }
+        if (!ownedReplacementId) {
+          try {
+            configuredAgent = await acpGetAgentStatus(agentType)
+          } catch (error) {
+            const reason = t("unableReadAgentConfig", {
+              message: normalizeErrorMessage(error),
+            })
+            publishConnectError({
+              agentType,
+              title: t("connectFailedTitle", {
+                agent: getAgentLabel(agentType),
+              }),
+              detail: reason,
+              opensAgentSettings: true,
+            })
+            throw createAlertedError(reason)
+          }
 
-        const blocked = resolveConnectBlockState(configuredAgent)
-        if (blocked.kind !== "none") {
-          // "…is not installed" is a whole headline on its own; the other
-          // blocks read as the reason a connect failed.
-          publishConnectError(
-            blocked.kind === "sdk_missing"
-              ? {
-                  agentType,
-                  title: blocked.reason,
-                  detail: null,
-                  opensAgentSettings: true,
-                }
-              : {
-                  agentType,
-                  title: t("connectFailedTitle", {
-                    agent: getAgentLabel(agentType),
-                  }),
-                  detail: blocked.reason,
-                  opensAgentSettings: true,
-                }
-          )
-          throw createAlertedError(blocked.reason)
+          const blocked = resolveConnectBlockState(configuredAgent)
+          if (blocked.kind !== "none") {
+            // "…is not installed" is a whole headline on its own; the other
+            // blocks read as the reason a connect failed.
+            publishConnectError(
+              blocked.kind === "sdk_missing"
+                ? {
+                    agentType,
+                    title: blocked.reason,
+                    detail: null,
+                    opensAgentSettings: true,
+                  }
+                : {
+                    agentType,
+                    title: t("connectFailedTitle", {
+                      agent: getAgentLabel(agentType),
+                    }),
+                    detail: blocked.reason,
+                    opensAgentSettings: true,
+                  }
+            )
+            throw createAlertedError(blocked.reason)
+          }
         }
 
         const nextWorkingDir = workingDir ?? null
@@ -6381,6 +6396,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         if (existing) {
           if (
+            !ownedReplacementId &&
             existing.agentType === agentType &&
             existing.workingDir === nextWorkingDir &&
             existing.status !== "disconnected" &&
@@ -6422,7 +6438,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // {agent}-{convId}"), and the orphaned connection holds the
         // in-flight live state (live_message, pending_permission, etc.)
         // that we want to preserve across the remount.
-        if (!existing && sessionId) {
+        if (!ownedReplacementId && !existing && sessionId) {
           let orphanKey: string | null = null
           let orphanConn: ConnectionState | null = null
           for (const [key, conn] of storeRef.current.connections) {
@@ -6492,7 +6508,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // streaming). Only for real persisted conversations (id > 0) — a
         // brand-new conversation has no live owner yet, so we spawn + own.
         // Best-effort: a discovery failure falls through to the owner spawn.
-        if (conversationId != null && conversationId > 0) {
+        if (
+          !ownedReplacementId &&
+          conversationId != null &&
+          conversationId > 0
+        ) {
           let discovered: ConversationConnectionInfo | null = null
           try {
             // Pass sessionId so discovery can fall back to external_id when the
@@ -6573,13 +6593,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // re-open (the snapshot frame doesn't carry a `session_modes` event,
         // so the apply-on-event hook never fired).
         const savedPrefs = getSavedPrefsForConnect(agentType)
-        const connectionId = await acpConnect(
-          agentType,
-          workingDir,
-          sessionId,
-          savedPrefs.modeId,
-          savedPrefs.configValues
-        )
+        const connectionId =
+          ownedReplacementId ??
+          (await acpConnect(
+            agentType,
+            workingDir,
+            sessionId,
+            savedPrefs.modeId,
+            savedPrefs.configValues
+          ))
 
         // If disconnect was requested while connect was in flight, tear down
         // immediately instead of registering the connection — but tear down
@@ -7051,6 +7073,82 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [connect, disconnect, resolveReconnectRequest, waitForConnectSettled]
   )
 
+  const restartStalled = useCallback(
+    async (contextKey: string): Promise<boolean> => {
+      // A connect already in flight may still own this key's route. Wait for
+      // it before asking the backend to restart, then reserve the key so a
+      // new local connect cannot swallow the replacement ID while we await.
+      for (let i = 0; i < MAX_RECONNECT_SETTLE_WAITS; i++) {
+        if (!connectingKeysRef.current.has(contextKey)) break
+        if (!(await waitForConnectSettled(contextKey))) return false
+      }
+      if (connectingKeysRef.current.has(contextKey)) return false
+      if (restartingKeysRef.current.has(contextKey)) return false
+      restartingKeysRef.current.add(contextKey)
+      try {
+        const conn = storeRef.current.connections.get(contextKey)
+        if (
+          !conn ||
+          conn.isViewer ||
+          conn.isDelegationChild ||
+          !conn.sessionId
+        ) {
+          return false
+        }
+        const request = resolveReconnectRequest(contextKey)
+        if (!request?.sessionId) return false
+        const prefs = getSavedPrefsForConnect(conn.agentType)
+        // One backend operation holds the session's dedup lock across teardown,
+        // the actual child reap, old lifecycle writes, and session/load.
+        const replacementId = await acpRestart(
+          conn.connectionId,
+          prefs.modeId,
+          prefs.configValues
+        )
+        try {
+          // Local viewer tabs may not have received the old terminal event.
+          // Retire their old routes before the owner attaches the replacement.
+          for (const [key, entry] of storeRef.current.connections) {
+            if (
+              key !== contextKey &&
+              entry.connectionId === conn.connectionId
+            ) {
+              markConnectionGone(key, conn.connectionId)
+            }
+          }
+          // The old backend entry is now gone. This releases the owner's old
+          // local route; ConnectionNotFound cannot kill the new connection.
+          await disconnect(contextKey)
+          await connect(
+            contextKey,
+            request.agentType,
+            request.workingDir,
+            request.sessionId,
+            request.conversationId,
+            replacementId
+          )
+        } catch (error) {
+          // Keep the confirmed replacement alive. A local attach failure may
+          // be a transient transport outage; an unconfirmed disconnect would
+          // remove its active map entry before its child exits, allowing a
+          // second process on the next connect. Normal reconnect deduplicates
+          // against this still-live replacement.
+          throw error
+        }
+        return true
+      } finally {
+        restartingKeysRef.current.delete(contextKey)
+      }
+    },
+    [
+      connect,
+      disconnect,
+      markConnectionGone,
+      resolveReconnectRequest,
+      waitForConnectSettled,
+    ]
+  )
+
   reconnectRef.current = reconnect
 
   const dismissConfigStale = useCallback(
@@ -7460,6 +7558,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       detachDelegationChild,
       reapplyConfig,
       reconnect,
+      restartStalled,
       getReconnectInfo,
       dismissConfigStale,
       dismissSessionFailures: dismissSessionFailuresAction,
@@ -7488,6 +7587,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       detachDelegationChild,
       reapplyConfig,
       reconnect,
+      restartStalled,
       getReconnectInfo,
       dismissConfigStale,
       dismissSessionFailuresAction,

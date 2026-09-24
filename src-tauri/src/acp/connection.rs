@@ -10409,6 +10409,11 @@ async fn run_conversation_loop(
                                 Ok(dispatch) => fix_usage_update_nulls(dispatch),
                                 Err(e) => return Err(defer_to_connection_report(e).await),
                             };
+                            // This is a frame from the agent, unlike the
+                            // frontend keepalive that updates last_activity_at.
+                            // Record even metadata-only or unreadable frames:
+                            // silence means no ACP traffic, not no rendered text.
+                            state.write().await.note_agent_update();
                             let h = emitter.clone();
                             let st = Arc::clone(state);
                             let runtime = terminal_runtime.clone();
