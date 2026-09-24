@@ -8,7 +8,7 @@ use sea_orm::{
 
 use crate::acp::session_state::SessionLastError;
 use crate::db::entities::conversation::ConversationKind;
-use crate::db::entities::{conversation, folder};
+use crate::db::entities::{conversation, conversation_external_alias, folder};
 use crate::db::error::DbError;
 use crate::models::{AgentType, DbConversationSummary};
 
@@ -353,9 +353,33 @@ async fn persist_last_error_for_target(
         .filter(conversation::Column::DeletedAt.is_null())
         .filter(conversation::Column::LastErrorScopeSequence.lte(scope_sequence));
     let query = match target {
-        LastErrorTarget::AgentSession(agent_type, session_id) => query
-            .filter(conversation::Column::ExternalId.eq(session_id))
-            .filter(conversation::Column::AgentType.eq(agent_type.as_wire().as_ref())),
+        LastErrorTarget::AgentSession(agent_type, session_id) => {
+            use sea_orm::sea_query::{Condition, Query};
+            let agent = agent_type.as_wire().to_string();
+            let alias_target = Query::select()
+                .column(conversation_external_alias::Column::ConversationId)
+                .from(conversation_external_alias::Entity)
+                .and_where(conversation_external_alias::Column::AgentType.eq(&agent))
+                .and_where(conversation_external_alias::Column::Alias.eq(session_id))
+                .to_owned();
+            let alias_exists = Query::select()
+                .expr(Expr::val(1))
+                .from(conversation_external_alias::Entity)
+                .and_where(conversation_external_alias::Column::AgentType.eq(&agent))
+                .and_where(conversation_external_alias::Column::Alias.eq(session_id))
+                .to_owned();
+            query
+                .filter(conversation::Column::AgentType.eq(agent))
+                .filter(
+                    Condition::any()
+                        .add(conversation::Column::Id.in_subquery(alias_target))
+                        .add(
+                            Condition::all()
+                                .add(conversation::Column::ExternalId.eq(session_id))
+                                .add(Expr::exists(alias_exists).not()),
+                        ),
+                )
+        },
         LastErrorTarget::UnboundRow(conversation_id) => query
             .filter(conversation::Column::Id.eq(conversation_id))
             .filter(conversation::Column::ExternalId.is_null()),
@@ -892,9 +916,28 @@ pub async fn bind_external_id(
                     })?;
 
                 let previous = current.external_id.clone();
+                let alias_holder = conversation_external_alias::Entity::find()
+                    .filter(
+                        conversation_external_alias::Column::AgentType
+                            .eq(current.agent_type.clone()),
+                    )
+                    .filter(conversation_external_alias::Column::Alias.eq(external_id.clone()))
+                    .one(txn)
+                    .await?;
+                if let Some(alias) = alias_holder.as_ref() {
+                    if alias.conversation_id != conversation_id {
+                        return Ok(BindTxOutcome::Refused {
+                            holder_row_id: alias.conversation_id,
+                        });
+                    }
+                }
+                let requested_is_own_alias = alias_holder.is_some();
                 let repoints_away = matches!(
                     previous.as_deref(),
-                    Some(prev) if prev != external_id && !continues.iter().any(|c| c == prev)
+                    Some(prev)
+                        if prev != external_id
+                            && !continues.iter().any(|c| c == prev)
+                            && !requested_is_own_alias
                 );
 
                 // Conflict guard, covering BOTH write branches below.
@@ -940,7 +983,9 @@ pub async fn bind_external_id(
                 // violation used to, and the retry in
                 // `lifecycle::handle_event_with_retry` gives up after three
                 // attempts.
-                if previous.as_deref() != Some(external_id.as_str()) {
+                if previous.as_deref() != Some(external_id.as_str())
+                    && !requested_is_own_alias
+                {
                     let holder = conversation::Entity::find()
                         .filter(conversation::Column::ExternalId.eq(external_id.clone()))
                         .filter(conversation::Column::AgentType.eq(current.agent_type.clone()))
@@ -976,6 +1021,12 @@ pub async fn bind_external_id(
                 // the sidebar every time a memory-only custom agent restarts.
                 // Nothing to preserve in any of these.
                 if !repoints_away {
+                    // A live ACP id can be an alias for this same row after
+                    // detail normalization. Keep the parser id on the row so
+                    // future detail reads still find its transcript.
+                    if requested_is_own_alias {
+                        return Ok(BindTxOutcome::Bound(None));
+                    }
                     let mut active: conversation::ActiveModel = current.into();
                     active.external_id = Set(Some(external_id));
                     active.updated_at = Set(now);
@@ -1047,6 +1098,18 @@ pub async fn bind_external_id(
 
                 let agent_type = carried.agent_type.clone();
                 let preserved = carried.into_active_model(previous.clone()).insert(txn).await?;
+                // A parser alias names S1's history, so it follows the
+                // preserving row rather than remaining on the re-bound S2 row.
+                conversation_external_alias::Entity::update_many()
+                    .col_expr(
+                        conversation_external_alias::Column::ConversationId,
+                        Expr::value(preserved.id),
+                    )
+                    .filter(
+                        conversation_external_alias::Column::ConversationId.eq(conversation_id),
+                    )
+                    .exec(txn)
+                    .await?;
                 // The one signal that this happened at all. Deliberately WARN:
                 // every occurrence means a connection bound to a row while
                 // holding a session unrelated to that row's history, which is
@@ -1223,19 +1286,78 @@ pub async fn renormalize_external_id_alias(
     conversation_id: i32,
     expected_old: Option<&str>,
     external_id: String,
-) -> Result<(), DbError> {
+) -> Result<bool, DbError> {
     use sea_orm::sea_query::Expr;
-    let mut query = conversation::Entity::update_many()
-        .col_expr(conversation::Column::ExternalId, Expr::value(external_id))
-        .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()))
-        .filter(conversation::Column::Id.eq(conversation_id))
-        .filter(conversation::Column::DeletedAt.is_null());
-    query = match expected_old {
-        Some(old) => query.filter(conversation::Column::ExternalId.eq(old)),
-        None => query.filter(conversation::Column::ExternalId.is_null()),
-    };
-    query.exec(conn).await?;
-    Ok(())
+    use sea_orm::TransactionTrait;
+
+    let expected_old = expected_old.map(str::to_owned);
+    conn.transaction::<_, bool, sea_orm::DbErr>(|txn| {
+        Box::pin(async move {
+            // The CAS and alias insert share one SQLite writer transaction:
+            // an Error sees either the old exact id or the new id plus alias.
+            let mut query = conversation::Entity::update_many()
+                .col_expr(conversation::Column::ExternalId, Expr::value(external_id.clone()))
+                .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()))
+                .filter(conversation::Column::Id.eq(conversation_id))
+                .filter(conversation::Column::DeletedAt.is_null());
+            query = match expected_old.as_deref() {
+                Some(old) => query.filter(conversation::Column::ExternalId.eq(old)),
+                None => query.filter(conversation::Column::ExternalId.is_null()),
+            };
+            if query.exec(txn).await?.rows_affected == 0 {
+                return Ok(false);
+            }
+            let row = conversation::Entity::find_by_id(conversation_id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| sea_orm::DbErr::Custom("alias row vanished".into()))?;
+            let new_name_holder = conversation_external_alias::Entity::find()
+                .filter(conversation_external_alias::Column::AgentType.eq(&row.agent_type))
+                .filter(conversation_external_alias::Column::Alias.eq(&external_id))
+                .one(txn)
+                .await?;
+            if new_name_holder
+                .as_ref()
+                .is_some_and(|alias| alias.conversation_id != conversation_id)
+            {
+                return Err(sea_orm::DbErr::Custom(
+                    "parser session id belongs to another conversation alias".into(),
+                ));
+            }
+            if let Some(old) = expected_old.as_deref().filter(|old| *old != external_id) {
+                let existing = conversation_external_alias::Entity::find()
+                    .filter(conversation_external_alias::Column::AgentType.eq(&row.agent_type))
+                    .filter(conversation_external_alias::Column::Alias.eq(old))
+                    .one(txn)
+                    .await?;
+                match existing {
+                    Some(alias) if alias.conversation_id == conversation_id => {}
+                    Some(_) => {
+                        return Err(sea_orm::DbErr::Custom(
+                            "agent session alias belongs to another conversation".into(),
+                        ));
+                    }
+                    None => {
+                        conversation_external_alias::ActiveModel {
+                            id: NotSet,
+                            conversation_id: Set(conversation_id),
+                            agent_type: Set(row.agent_type),
+                            alias: Set(old.to_owned()),
+                        }
+                        .insert(txn)
+                        .await?;
+                    }
+                }
+            }
+            Ok(true)
+        })
+    })
+    .await
+    .map_err(|e| match e {
+        sea_orm::TransactionError::Connection(e) | sea_orm::TransactionError::Transaction(e) => {
+            DbError::Database(e)
+        }
+    })
 }
 
 /// Re-parent every live conversation of `from_folder_id` (a task worktree
@@ -3678,6 +3800,170 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn binding_refuses_a_session_spelling_reserved_as_another_rows_alias() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/acp-alias-claim").await;
+        let original = create(&db.conn, folder, AgentType::Gemini, None, None)
+            .await
+            .unwrap();
+        bind_external_id(&db.conn, original.id, "acp-uuid", &[])
+            .await
+            .unwrap();
+        renormalize_external_id_alias(
+            &db.conn, original.id, Some("acp-uuid"), "parser-branch".into(),
+        )
+        .await
+        .unwrap();
+        let other = create(&db.conn, folder, AgentType::Gemini, None, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            bind_external_id(&db.conn, other.id, "acp-uuid", &[]).await,
+            Err(DbError::Conflict(_))
+        ));
+        assert!(
+            get_by_id(&db.conn, other.id)
+                .await
+                .unwrap()
+                .external_id
+                .is_none()
+        );
+        assert!(
+            bind_external_id(&db.conn, original.id, "acp-uuid", &[])
+                .await
+                .unwrap()
+                .is_none(),
+            "reusing one's own alias is the same session, not a split"
+        );
+        assert_eq!(
+            get_by_id(&db.conn, original.id)
+                .await
+                .unwrap()
+                .external_id
+                .as_deref(),
+            Some("parser-branch"),
+            "the parser's transcript id must remain readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_error_targets_one_history_row_through_split_and_delete() {
+        use crate::acp::session_state::SessionLastError;
+
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/acp-alias-rebind").await;
+        let active = create(&db.conn, folder, AgentType::Gemini, None, None)
+            .await
+            .unwrap();
+        bind_external_id(&db.conn, active.id, "acp-uuid", &[])
+            .await
+            .unwrap();
+        renormalize_external_id_alias(
+            &db.conn,
+            active.id,
+            Some("acp-uuid"),
+            "parser-branch".into(),
+        )
+        .await
+        .unwrap();
+        // A different row now owns an exact id with the old spelling.
+        let collision = create(&db.conn, folder, AgentType::Gemini, None, None)
+            .await
+            .unwrap();
+        // Force an adverse legacy DB state directly. Normal binding must
+        // refuse a spelling already reserved as another row's alias.
+        use sea_orm::sea_query::Expr;
+        conversation::Entity::update_many()
+            .col_expr(conversation::Column::ExternalId, Expr::value("acp-uuid"))
+            .filter(conversation::Column::Id.eq(collision.id))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            persist_last_error_for_agent_session(
+                &db.conn,
+                AgentType::Gemini,
+                "acp-uuid",
+                "old-live",
+                5,
+                Some(&SessionLastError {
+                    message: "original session".into(),
+                    code: None,
+                    details: None,
+                }),
+            )
+            .await
+            .unwrap(),
+            1,
+            "an alias and an exact id must never update two rows"
+        );
+        assert_eq!(
+            get_last_error(&db.conn, active.id)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "original session"
+        );
+        assert!(get_last_error(&db.conn, collision.id).await.unwrap().0.is_none());
+
+        let preserved = bind_external_id(&db.conn, active.id, "S2", &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persist_last_error_for_agent_session(
+                &db.conn,
+                AgentType::Gemini,
+                "acp-uuid",
+                "old-live",
+                6,
+                Some(&SessionLastError {
+                    message: "late original session".into(),
+                    code: None,
+                    details: None,
+                }),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            get_last_error(&db.conn, preserved)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "late original session"
+        );
+        assert!(get_last_error(&db.conn, active.id).await.unwrap().0.is_none());
+        assert!(get_last_error(&db.conn, collision.id).await.unwrap().0.is_none());
+
+        soft_delete(&db.conn, preserved).await.unwrap();
+        assert_eq!(
+            persist_last_error_for_agent_session(
+                &db.conn,
+                AgentType::Gemini,
+                "acp-uuid",
+                "old-live",
+                7,
+                Some(&SessionLastError {
+                    message: "deleted history".into(),
+                    code: None,
+                    details: None,
+                }),
+            )
+            .await
+            .unwrap(),
+            0,
+            "a deleted alias target must not fall through to the exact collision"
+        );
+        assert!(get_last_error(&db.conn, collision.id).await.unwrap().0.is_none());
     }
 
     #[tokio::test]
