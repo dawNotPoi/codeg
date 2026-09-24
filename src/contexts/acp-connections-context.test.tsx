@@ -45,6 +45,7 @@ const h = vi.hoisted(() => {
     acpGetAgentStatus: vi.fn(),
     acpFindConnectionForConversation: vi.fn(),
     acpConnect: vi.fn(),
+    acpRestart: vi.fn(),
     acpDisconnect: vi.fn(),
     acpGetSessionSnapshot: vi.fn(),
     acpTouchConnection: vi.fn(),
@@ -121,6 +122,7 @@ vi.mock("@/lib/api", () => ({
   acpGetAgentStatus: h.acpGetAgentStatus,
   acpFindConnectionForConversation: h.acpFindConnectionForConversation,
   acpConnect: h.acpConnect,
+  acpRestart: h.acpRestart,
   acpDisconnect: h.acpDisconnect,
   acpGetSessionSnapshot: h.acpGetSessionSnapshot,
   acpPrompt: vi.fn(),
@@ -171,6 +173,7 @@ beforeEach(() => {
   h.acpGetAgentStatus.mockReset()
   h.acpFindConnectionForConversation.mockReset()
   h.acpConnect.mockReset()
+  h.acpRestart.mockReset()
   h.acpDisconnect.mockReset()
   h.acpGetSessionSnapshot.mockReset()
   h.denormalizeSnapshot.mockReset()
@@ -207,6 +210,7 @@ beforeEach(() => {
     is_acp_adapter: true,
   })
   h.acpConnect.mockResolvedValue("spawned-conn")
+  h.acpRestart.mockResolvedValue("replacement-conn")
   h.acpDisconnect.mockResolvedValue(undefined)
   h.acpGetSessionSnapshot.mockResolvedValue(null)
   h.acpTouchConnection.mockReset()
@@ -1029,6 +1033,134 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
       await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
     })
   }
+
+  it("attaches to the backend-confirmed restart without a second spawn or viewer discovery", async () => {
+    await connectOwner()
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+
+    let result: boolean | undefined
+    await act(async () => {
+      result = await h.actions!.restartStalled(TAB)
+    })
+
+    expect(result).toBe(true)
+    expect(h.acpRestart).toHaveBeenCalledWith("spawned-conn", undefined, {})
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    expect(h.acpFindConnectionForConversation).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("replacement-conn")
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(false)
+  })
+
+  it("does not rescue a stale local viewer of the old process into the restarted owner", async () => {
+    await connectOwner()
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "spawned-conn",
+      event_seq: 1,
+    })
+    await act(async () => {
+      // A detail opened by numeric conversation ID before its session ID is
+      // loaded takes the viewer discovery path instead of local orphan rescue.
+      await h.actions!.connect(
+        "viewer-tab",
+        "claude_code",
+        "/tmp/x",
+        undefined,
+        42
+      )
+    })
+    expect(h.store!.getConnection("viewer-tab")?.isViewer).toBe(true)
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+
+    // The old Disconnected event has not reached the viewer when A restarts.
+    await act(async () => {
+      await h.actions!.restartStalled(TAB)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("replacement-conn")
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(false)
+    expect(h.store!.getConnection("viewer-tab")?.status).toBe("disconnected")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("waits for a pending local connect before attaching the confirmed replacement", async () => {
+    await connectOwner()
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    let finishPreflight!: (status: unknown) => void
+    h.acpGetAgentStatus.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishPreflight = resolve
+        })
+    )
+    let pendingConnect!: Promise<void>
+    act(() => {
+      pendingConnect = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sess-1",
+        42
+      )
+    })
+    let pendingRestart!: Promise<boolean>
+    act(() => {
+      pendingRestart = h.actions!.restartStalled(TAB)
+    })
+    expect(h.acpRestart).not.toHaveBeenCalled()
+    await act(async () => {
+      finishPreflight({
+        agent_type: "claude_code",
+        enabled: true,
+        available: true,
+        installed_version: "1.0.0",
+        host_tools_agent_mode: false,
+        is_acp_adapter: true,
+      })
+      await pendingConnect
+      expect(await pendingRestart).toBe(true)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("replacement-conn")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps the old connection when backend cannot confirm process teardown", async () => {
+    await connectOwner()
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    h.acpRestart.mockRejectedValue(new Error("old agent was not reaped"))
+
+    await expect(h.actions!.restartStalled(TAB)).rejects.toThrow(
+      "old agent was not reaped"
+    )
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("spawned-conn")
+  })
 
   it("restarts a live owner with the same identity", async () => {
     await connectOwner()
