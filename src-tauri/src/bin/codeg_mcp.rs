@@ -166,36 +166,6 @@ fn parse_csv(raw: Option<&str>) -> Vec<String> {
     .unwrap_or_default()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn capability_token_must_come_from_nonempty_environment() {
-        let argv = || {
-            [
-                "--parent-connection-id",
-                "parent",
-                "--socket-path",
-                "/tmp/codeg.sock",
-            ]
-            .into_iter()
-            .map(str::to_string)
-        };
-
-        assert!(parse_args_from(argv(), None).is_err());
-        assert!(parse_args_from(argv(), Some(String::new())).is_err());
-        assert!(parse_args_from(argv(), Some("  ".to_string())).is_err());
-
-        let parsed = parse_args_from(argv(), Some("test-capability".to_string()))
-            .expect("nonempty environment token is accepted");
-        assert_eq!(parsed.token, "test-capability");
-
-        let legacy_argv = argv().chain(["--token".to_string(), "legacy-value".to_string()]);
-        assert!(parse_args_from(legacy_argv, Some("test-capability".to_string())).is_err());
-    }
-}
-
 /// Serialize a `JsonRpcResponse` and append a newline; small enough to keep
 /// inline so the write-mutex critical section stays tight.
 async fn write_response(
@@ -345,4 +315,34 @@ async fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_token_must_come_from_nonempty_environment() {
+        let argv = || {
+            [
+                "--parent-connection-id",
+                "parent",
+                "--socket-path",
+                "/tmp/codeg.sock",
+            ]
+            .into_iter()
+            .map(str::to_string)
+        };
+
+        assert!(parse_args_from(argv(), None).is_err());
+        assert!(parse_args_from(argv(), Some(String::new())).is_err());
+        assert!(parse_args_from(argv(), Some("  ".to_string())).is_err());
+
+        let parsed = parse_args_from(argv(), Some("test-capability".to_string()))
+            .expect("nonempty environment token is accepted");
+        assert_eq!(parsed.token, "test-capability");
+
+        let legacy_argv = argv().chain(["--token".to_string(), "legacy-value".to_string()]);
+        assert!(parse_args_from(legacy_argv, Some("test-capability".to_string())).is_err());
+    }
 }
