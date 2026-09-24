@@ -439,6 +439,9 @@ type RestartAfterSpawnHook = (
     tokio::sync::oneshot::Receiver<()>,
 );
 
+#[cfg(test)]
+type RestartBeforeReservationHook = RestartAfterSpawnHook;
+
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
     /// Connections whose teardown was requested but whose child process has
@@ -476,6 +479,8 @@ pub struct ConnectionManager {
     restart_quarantines: Arc<Mutex<HashMap<SpawnDedupKey, Arc<RestartQuarantine>>>>,
     #[cfg(test)]
     restart_after_spawn_hook: Arc<Mutex<Option<RestartAfterSpawnHook>>>,
+    #[cfg(test)]
+    restart_before_reservation_hook: Arc<Mutex<Option<RestartBeforeReservationHook>>>,
     /// One-shot acknowledgements from the per-connection lifecycle worker.
     /// A restart registers before requesting disconnect, so a late old
     /// terminal event cannot cancel the replacement turn.
@@ -558,6 +563,8 @@ impl ConnectionManager {
             restart_quarantines: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             restart_after_spawn_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            restart_before_reservation_hook: Arc::new(Mutex::new(None)),
             restart_terminal_waiters: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
@@ -579,6 +586,8 @@ impl ConnectionManager {
             restart_quarantines: self.restart_quarantines.clone(),
             #[cfg(test)]
             restart_after_spawn_hook: self.restart_after_spawn_hook.clone(),
+            #[cfg(test)]
+            restart_before_reservation_hook: self.restart_before_reservation_hook.clone(),
             restart_terminal_waiters: self.restart_terminal_waiters.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
             terminal_shell_config: self.terminal_shell_config.clone(),
@@ -635,6 +644,7 @@ impl ConnectionManager {
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             restart_quarantines: Arc::new(Mutex::new(HashMap::new())),
             restart_after_spawn_hook: Arc::new(Mutex::new(None)),
+            restart_before_reservation_hook: Arc::new(Mutex::new(None)),
             restart_terminal_waiters: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: timeout,
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
@@ -2490,6 +2500,14 @@ impl ConnectionManager {
                 })?,
             }
         };
+        #[cfg(test)]
+        {
+            let hook = self.restart_before_reservation_hook.lock().await.take();
+            if let Some((reached, resume)) = hook {
+                let _ = reached.send(());
+                let _ = resume.await;
+            }
+        }
         let quarantine = Arc::new(RestartQuarantine {
             state: Mutex::new(RestartQuarantineState {
                 connection_id: conn_id.to_string(),
@@ -2497,24 +2515,63 @@ impl ConnectionManager {
                 terminal: 0,
             }),
         });
-        let mut quarantines = self.restart_quarantines.lock().await;
-        if quarantines.contains_key(&key) {
-            return Err(AcpError::protocol(
-                "a restart is already stopping this session",
-            ));
-        }
-        quarantines.insert(key, quarantine);
-        drop(quarantines);
-
         let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
-        self.restart_terminal_waiters
-            .lock()
-            .await
-            .insert(conn_id.to_string(), terminal_tx);
-        if let Err(err) = self.disconnect(conn_id).await {
-            self.restart_terminal_waiters.lock().await.remove(conn_id);
-            return Err(err);
-        }
+        let cmd_tx = loop {
+            // Ordinary disconnect and driver cleanup remove entries under
+            // this lock. Recheck the same connection, then reserve its terminal
+            // callback before removing it; neither can finish in between.
+            let mut connections = self.connections.lock().await;
+            {
+                let conn = connections
+                    .get(conn_id)
+                    .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.to_string()))?;
+                if !Arc::ptr_eq(&conn.state, &state)
+                    || !Arc::ptr_eq(&conn.child_pid, &child_pid)
+                    || conn.owner_window_label != owner_window_label
+                {
+                    return Err(AcpError::protocol("the connection changed before restart"));
+                }
+                // A status writer must finish without waiting on the map lock.
+                // Retry the atomic reservation after it releases the state.
+                let current = match state.try_read() {
+                    Ok(current) => current,
+                    Err(_) => {
+                        drop(connections);
+                        drop(state.read().await);
+                        continue;
+                    }
+                };
+                if conn.child_pid.load(Ordering::SeqCst) == 0
+                    || !matches!(
+                        current.status,
+                        ConnectionStatus::Connected | ConnectionStatus::Prompting
+                    )
+                    || current.agent_type != key.agent_type
+                    || current.working_dir != key.working_dir
+                    || current.external_id.as_deref() != Some(key.session_id.as_str())
+                {
+                    return Err(AcpError::protocol(
+                        "agent process or session changed before restart; reconnect instead",
+                    ));
+                }
+                let mut quarantines = self.restart_quarantines.lock().await;
+                if quarantines.contains_key(&key) {
+                    return Err(AcpError::protocol(
+                        "a restart is already stopping this session",
+                    ));
+                }
+                quarantines.insert(key, quarantine);
+                self.restart_terminal_waiters
+                    .lock()
+                    .await
+                    .insert(conn_id.to_string(), terminal_tx);
+            }
+            let conn = connections.remove(conn_id).expect("validated connection");
+            self.park_draining(&conn).await;
+            break conn.cmd_tx;
+        };
+        tracing::info!("[ACP] disconnect connection={}", conn_id);
+        let _ = cmd_tx.send(ConnectionCommand::Disconnect).await;
 
         // The driver gets its normal cleanup opportunity first. If it cannot
         // leave promptly, escalate this ONE child tree, then still await the
@@ -5168,6 +5225,77 @@ mod tests {
         let mgr = restart.await.expect("restart task").expect("confirmed restart");
         assert!(mgr.get_state("stalled").await.is_none());
         assert!(mgr.get_state("other").await.is_some());
+    }
+
+    /// An unmount can finish ordinary disconnect and its lifecycle callback
+    /// after restart reads the session but before it installs the reservation.
+    /// A late restart must not leave a pending quarantine with no future callback.
+    #[tokio::test]
+    async fn ordinary_disconnect_before_restart_reservation_leaves_session_reconnectable() {
+        let mgr = ConnectionManager::new();
+        let agent = AgentType::Custom("test-absent-restart-agent-807-race");
+        mgr.insert_test_connection("old", agent, None, EventEmitter::Noop)
+            .await;
+        mgr.get_state("old")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .external_id = Some("same-session".into());
+        let pid = mgr
+            .connections
+            .lock()
+            .await
+            .get("old")
+            .unwrap()
+            .child_pid
+            .clone();
+        pid.store(42, Ordering::SeqCst);
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *mgr.restart_before_reservation_hook.lock().await = Some((reached_tx, resume_rx));
+        let restart_mgr = mgr.clone_ref();
+        let restart = tokio::spawn(async move {
+            restart_mgr
+                .disconnect_for_restart("old", "test-window")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), reached_rx)
+            .await
+            .expect("restart reached reservation gap")
+            .expect("restart hook closed");
+
+        mgr.disconnect("old").await.expect("unmount disconnect");
+        pid.store(0, Ordering::SeqCst);
+        mgr.complete_restart_terminal("old", Ok(())).await;
+        resume_tx.send(()).expect("resume restart");
+        assert!(matches!(
+            restart.await.expect("restart task"),
+            Err(AcpError::ConnectionNotFound(_))
+        ));
+        let key = SpawnDedupKey {
+            agent_type: agent,
+            working_dir: None,
+            session_id: "same-session".into(),
+        };
+        mgr.ensure_restart_quarantine_clear(&key)
+            .await
+            .expect("ordinary disconnect must not strand reconnect");
+        assert!(mgr.restart_quarantines.lock().await.is_empty());
+        assert!(mgr.restart_terminal_waiters.lock().await.is_empty());
+        let reconnect = mgr
+            .spawn_agent(
+                agent,
+                None,
+                Some("same-session".into()),
+                BTreeMap::new(),
+                "test-window".into(),
+                EventEmitter::Noop,
+                None,
+                BTreeMap::new(),
+            )
+            .await;
+        assert!(matches!(reconnect, Err(AcpError::SdkNotInstalled(_))));
     }
 
     #[tokio::test]
