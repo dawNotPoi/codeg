@@ -1544,9 +1544,32 @@ async fn connection_worker_loop(
     // the terminal work; the second one is a no-op so the broker / DB
     // aren't double-touched.
     let mut terminal_dispatched = false;
+    // Captured from SessionStarted in this FIFO, rather than reading the
+    // mutable SessionState later: another session can start before a queued
+    // Error reaches this worker.
+    let mut event_session: Option<crate::acp::manager::ErrorSessionHint> = None;
     while let Some(work) = rx.recv().await {
         let envelope: &EventEnvelope = work.envelope.as_ref();
         match &envelope.payload {
+            AcpEvent::SessionStarted { session_id } => {
+                let state = if let Some(entry) = cache.get(&connection_id) {
+                    Some(entry.state.clone())
+                } else {
+                    manager.get_state(&connection_id).await
+                };
+                let agent_type = if let Some(state) = state {
+                    Some(state.read().await.agent_type)
+                } else {
+                    manager.error_session_hint(&connection_id).await.map(|hint| hint.agent_type)
+                };
+                if let Some(agent_type) = agent_type {
+                    event_session = Some(crate::acp::manager::ErrorSessionHint {
+                        agent_type,
+                        session_id: session_id.clone(),
+                    });
+                }
+                handle_event_with_retry(&db, &manager, envelope, broker.as_ref()).await;
+            }
             AcpEvent::ConversationLinked {
                 conversation_id, ..
             } => {
@@ -1566,6 +1589,7 @@ async fn connection_worker_loop(
                     &manager,
                     &connection_id,
                     work.scope_sequence,
+                    event_session.as_ref(),
                     None,
                 )
                 .await;
@@ -1597,6 +1621,7 @@ async fn connection_worker_loop(
                     &manager,
                     &connection_id,
                     work.scope_sequence,
+                    event_session.as_ref(),
                     Some(&SessionLastError {
                         message: message.clone(),
                         code: code.clone(),
@@ -1646,17 +1671,22 @@ async fn connection_worker_loop(
             }
         }
     }
+    // The manager entry may already be gone when the terminal Error arrives,
+    // but the immutable session hint lives until this worker has drained it.
+    manager.forget_error_session_hint(&connection_id).await;
 }
 
-/// Resolve the stable conversation id before a terminal connection is removed
-/// from the manager, then persist every Error (including non-terminal ones).
-/// The per-connection FIFO keeps Error/Prompting writes in event order.
+/// Persist every Error (including non-terminal ones) using the session
+/// identity observed in event order. A connect-time hint survives manager
+/// cleanup for failures before SessionStarted or ConversationLinked. Only
+/// still-unbound rows use their numeric id as a final fallback.
 async fn persist_last_error_for_connection(
     db: &DatabaseConnection,
     cache: &HashMap<String, CachedConn>,
     manager: &ConnectionManager,
     connection_id: &str,
     scope_sequence: i64,
+    event_session: Option<&crate::acp::manager::ErrorSessionHint>,
     error: Option<&SessionLastError>,
 ) {
     let state = if let Some(entry) = cache.get(connection_id) {
@@ -1664,54 +1694,49 @@ async fn persist_last_error_for_connection(
     } else {
         manager.get_state(connection_id).await
     };
-    let Some(state) = state else {
+    let cid = if let Some(entry) = cache.get(connection_id) {
+        Some(entry.conversation_id)
+    } else if let Some(state) = state {
+        state.read().await.conversation_id
+    } else {
+        None
+    };
+    let session_hint = if let Some(identity) = event_session {
+        Some(identity.clone())
+    } else {
+        // A historical fork can emit ConversationLinked before SessionStarted.
+        // Its validated original-session hint still wins over the numeric row.
+        manager.error_session_hint(connection_id).await
+    };
+    if cid.is_none() && session_hint.is_none() {
         return;
-    };
-    let cid = {
-        let state = state.read().await;
-        cache
-            .get(connection_id)
-            .map(|entry| entry.conversation_id)
-            .or(state.conversation_id)
-            .or(state.pending_error_conversation_id)
-    };
-    let Some(cid) = cid else {
-        return;
-    };
+    }
     let mut retry_backoffs = HANDLE_EVENT_RETRY_BACKOFFS.iter();
     loop {
-        let result = match error {
-            Some(error) => {
-                // An Error can arrive before the first Prompting event (for
-                // example session/load rejection). Claim in dispatch order,
-                // then write only while this event still owns the scope.
-                match conversation_service::begin_error_scope(
-                    db, cid, connection_id, scope_sequence,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        conversation_service::set_last_error(
-                            db,
-                            cid,
-                            connection_id,
-                            scope_sequence,
-                            error,
-                        )
-                        .await
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            None => {
-                conversation_service::begin_error_scope(
-                    db,
-                    cid,
-                    connection_id,
-                    scope_sequence,
-                )
-                .await
-            }
+        let result = if let Some(hint) = session_hint.as_ref() {
+            // Use the session observed in event order. A second connection
+            // may have rebound the linked numeric row to another session.
+            conversation_service::persist_last_error_for_agent_session(
+                db,
+                hint.agent_type,
+                &hint.session_id,
+                connection_id,
+                scope_sequence,
+                error,
+            )
+            .await
+            .map(|_| ())
+        } else if let Some(cid) = cid {
+            // No session identity has been emitted yet. Claim only while this
+            // numeric row is still unbound; a different client's bind makes
+            // the event stale rather than a write to its new session.
+            conversation_service::persist_last_error_for_unbound_row(
+                db, cid, connection_id, scope_sequence, error,
+            )
+            .await
+            .map(|_| ())
+        } else {
+            return;
         };
         match result {
             Ok(()) => return,
@@ -1719,7 +1744,7 @@ async fn persist_last_error_for_connection(
                 Some(backoff) => tokio::time::sleep(*backoff).await,
                 None => {
                     tracing::error!(
-                        "[lifecycle][ERROR] persist last_error for conversation {cid}: {e}"
+                        "[lifecycle][ERROR] persist last_error for connection {connection_id}: {e}"
                     );
                     return;
                 }
@@ -2474,17 +2499,31 @@ mod tests {
         )
         .await
         .unwrap();
+        conversation_service::bind_external_id(&db.conn, conv.id, "session-old", &[])
+            .await
+            .unwrap();
         let mgr = ConnectionManager::new();
-        let connection = fake_connection_with_state("history-load", None);
-        connection
-            .state
-            .write()
+        assert_eq!(
+            conversation_service::resolve_error_conversation_hint(
+                &db.conn, Some(conv.id), AgentType::ClaudeCode, Some("session-old")
+            )
             .await
-            .pending_error_conversation_id = Some(conv.id);
-        mgr.connections
-            .lock()
-            .await
-            .insert("history-load".into(), connection);
+            .unwrap(),
+            Some(conv.id)
+        );
+        mgr.register_error_session_hint(
+            "history-load",
+            AgentType::ClaudeCode,
+            "session-old".into(),
+        )
+        .await;
+        mgr.connections.lock().await.insert(
+            "history-load".into(),
+            fake_connection_with_state("history-load", None),
+        );
+        // Simulate ConnectionCleanupGuard running after the driver emits
+        // terminal Error but before the lifecycle worker receives it.
+        mgr.connections.lock().await.remove("history-load");
 
         let (tx, rx) = mpsc::channel(8);
         let worker = tokio::spawn(connection_worker_loop(
@@ -2503,7 +2542,7 @@ mod tests {
                     agent_type: "claude_code".into(),
                     code: Some("load_failed".into()),
                     details: None,
-                    terminal: false,
+                    terminal: true,
                 },
             }),
             scope_sequence: 1,
@@ -2512,14 +2551,8 @@ mod tests {
         .unwrap();
         drop(tx);
         worker.await.unwrap();
-        assert!(mgr
-            .get_state("history-load")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .conversation_id
-            .is_none());
+        assert!(mgr.get_state("history-load").await.is_none());
+        assert!(mgr.error_session_hint("history-load").await.is_none());
         db.conn.close().await.unwrap();
 
         let reopened = Database::connect(format!(
@@ -2536,6 +2569,229 @@ mod tests {
             "Failed to load session, starting new"
         );
         reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_load_error_follows_original_session_after_rebind() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/acp-error-rebind").await;
+        let active = conversation_service::create(
+            &db.conn, folder, AgentType::ClaudeCode, None, None,
+        )
+        .await
+        .unwrap();
+        conversation_service::bind_external_id(&db.conn, active.id, "session-S1", &[])
+            .await
+            .unwrap();
+        let mgr = ConnectionManager::new();
+        assert_eq!(
+            conversation_service::resolve_error_conversation_hint(
+                &db.conn, Some(active.id), AgentType::ClaudeCode, Some("session-S1")
+            )
+            .await
+            .unwrap(),
+            Some(active.id)
+        );
+        mgr.register_error_session_hint(
+            "delayed-S1",
+            AgentType::ClaudeCode,
+            "session-S1".into(),
+        )
+        .await;
+        conversation_service::begin_error_scope(&db.conn, active.id, "earlier-S1", 1)
+            .await
+            .unwrap();
+        conversation_service::set_last_error(
+            &db.conn,
+            active.id,
+            "earlier-S1",
+            1,
+            &SessionLastError {
+                message: "earlier S1 failure".into(),
+                code: None,
+                details: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Another client starts an unrelated session on the former row. The
+        // binder moves S1 to a preserving row before this worker gets Error.
+        let preserved_id = conversation_service::bind_external_id(
+            &db.conn, active.id, "session-S2", &[],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(preserved_id, active.id);
+
+        mgr.connections.lock().await.insert(
+            "delayed-S1".into(),
+            fake_connection_with_state("delayed-S1", None),
+        );
+        let (tx, rx) = mpsc::channel(8);
+        let worker = tokio::spawn(connection_worker_loop(
+            "delayed-S1".into(),
+            db.conn.clone(),
+            mgr.clone_ref(),
+            None,
+            rx,
+        ));
+        tx.send(LifecycleWork {
+            envelope: Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "delayed-S1".into(),
+                payload: AcpEvent::ConversationLinked {
+                    conversation_id: active.id,
+                    folder_id: folder,
+                    parent_conversation_id: None,
+                    parent_tool_use_id: None,
+                },
+            }),
+            scope_sequence: 4,
+        })
+        .await
+        .unwrap();
+        tx.send(LifecycleWork {
+            envelope: Arc::new(EventEnvelope {
+                seq: 2,
+                connection_id: "delayed-S1".into(),
+                payload: AcpEvent::Error {
+                    message: "S1 load failed".into(),
+                    agent_type: "claude_code".into(),
+                    code: Some("load_failed".into()),
+                    details: None,
+                    terminal: false,
+                },
+            }),
+            scope_sequence: 5,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        worker.await.unwrap();
+        assert!(
+            conversation_service::get_last_error(&db.conn, active.id)
+                .await
+                .unwrap()
+                .0
+                .is_none(),
+            "S2 must not receive S1's delayed error"
+        );
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, preserved_id)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "S1 load failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn linked_connection_error_uses_session_seen_before_other_client_rebinds_row() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/acp-linked-rebind").await;
+        let active = conversation_service::create(
+            &db.conn, folder, AgentType::ClaudeCode, None, None,
+        )
+        .await
+        .unwrap();
+        let mgr = ConnectionManager::new();
+        mgr.connections.lock().await.insert(
+            "linked-S1".into(),
+            fake_connection_with_state("linked-S1", Some(active.id)),
+        );
+        let (tx, rx) = mpsc::channel(8);
+        let worker = tokio::spawn(connection_worker_loop(
+            "linked-S1".into(),
+            db.conn.clone(),
+            mgr.clone_ref(),
+            None,
+            rx,
+        ));
+        tx.send(LifecycleWork {
+            envelope: Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "linked-S1".into(),
+                payload: AcpEvent::ConversationLinked {
+                    conversation_id: active.id,
+                    folder_id: folder,
+                    parent_conversation_id: None,
+                    parent_tool_use_id: None,
+                },
+            }),
+            scope_sequence: 1,
+        })
+        .await
+        .unwrap();
+        tx.send(LifecycleWork {
+            envelope: Arc::new(EventEnvelope {
+                seq: 2,
+                connection_id: "linked-S1".into(),
+                payload: AcpEvent::SessionStarted {
+                    session_id: "session-S1".into(),
+                },
+            }),
+            scope_sequence: 2,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row = conversation_service::get_by_id(&db.conn, active.id)
+                    .await
+                    .unwrap();
+                if row.external_id.as_deref() == Some("session-S1") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let preserved_id = conversation_service::bind_external_id(
+            &db.conn, active.id, "session-S2", &[],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tx.send(LifecycleWork {
+            envelope: Arc::new(EventEnvelope {
+                seq: 3,
+                connection_id: "linked-S1".into(),
+                payload: AcpEvent::Error {
+                    message: "late S1 failure".into(),
+                    agent_type: "claude_code".into(),
+                    code: None,
+                    details: None,
+                    terminal: false,
+                },
+            }),
+            scope_sequence: 3,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        worker.await.unwrap();
+        assert!(
+            conversation_service::get_last_error(&db.conn, active.id)
+                .await
+                .unwrap()
+                .0
+                .is_none(),
+            "new S2 row must stay clean"
+        );
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, preserved_id)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "late S1 failure"
+        );
     }
 
     #[tokio::test]
@@ -2723,16 +2979,16 @@ mod tests {
             details: None,
         };
         persist_last_error_for_connection(
-            &db.conn, &cache, &mgr, "older-tab", 1, Some(&stale),
+            &db.conn, &cache, &mgr, "older-tab", 1, None, Some(&stale),
         )
         .await;
         persist_last_error_for_connection(
-            &db.conn, &cache, &mgr, "newer-tab", 2, None,
+            &db.conn, &cache, &mgr, "newer-tab", 2, None, None,
         )
         .await;
         // A queued old event finishes after the newer tab started its prompt.
         persist_last_error_for_connection(
-            &db.conn, &cache, &mgr, "older-tab", 1, Some(&stale),
+            &db.conn, &cache, &mgr, "older-tab", 1, None, Some(&stale),
         )
         .await;
         assert!(conversation_service::get_last_error(&db.conn, conv.id)
@@ -2743,16 +2999,16 @@ mod tests {
 
         // The original tab remains usable and may start a genuinely later turn.
         persist_last_error_for_connection(
-            &db.conn, &cache, &mgr, "older-tab", 3, None,
+            &db.conn, &cache, &mgr, "older-tab", 3, None, None,
         )
         .await;
         persist_last_error_for_connection(
-            &db.conn, &cache, &mgr, "older-tab", 4, Some(&fresh),
+            &db.conn, &cache, &mgr, "older-tab", 4, None, Some(&fresh),
         )
         .await;
         // Even an old event from the same connection cannot overwrite scope 4.
         persist_last_error_for_connection(
-            &db.conn, &cache, &mgr, "older-tab", 1, Some(&stale),
+            &db.conn, &cache, &mgr, "older-tab", 1, None, Some(&stale),
         )
         .await;
         assert_eq!(
@@ -2783,7 +3039,7 @@ mod tests {
         let mut cache = HashMap::new();
         seed_cache(&mut cache, &mgr, "terminal-error", conv.id).await;
         persist_last_error_for_connection(
-            &db.conn, &cache, &mgr, "terminal-error", 1, None,
+            &db.conn, &cache, &mgr, "terminal-error", 1, None, None,
         )
         .await;
         mgr.connections.lock().await.remove("terminal-error");
@@ -2793,6 +3049,7 @@ mod tests {
             &mgr,
             "terminal-error",
             2,
+            None,
             Some(&SessionLastError {
                 message: "transport failed".into(),
                 code: None,
