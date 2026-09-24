@@ -6350,7 +6350,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             // A long-lived process can leave or fork its session after the
             // original tab closed. Recheck the backend identity before
             // treating this old local claim as ownership of its current work.
-            const snapshot = await acpGetSessionSnapshot(reclaim.connectionId)
+            // A previously confirmed process may already have exited. A
+            // missing or unreachable snapshot cannot establish ownership;
+            // retire the claim and take the ordinary connect path below.
+            const snapshot = await acpGetSessionSnapshot(
+              reclaim.connectionId
+            ).catch(() => null)
             if (
               abandonedKeysRef.current.has(contextKey) ||
               (surfaceGenerationRef.current.get(contextKey) ?? 0) !== generation
@@ -6699,14 +6704,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // Peek, don't consume: the `finally` clears the flag, and it has to
         // still see it to know this call established nothing (see there).
         if (abandonedKeysRef.current.has(contextKey)) {
-          if (!isConnectionReferencedLocally(connectionId)) {
+          if (
+            !ownedReplacementId &&
+            !isConnectionReferencedLocally(connectionId)
+          ) {
             acpDisconnect(connectionId).catch(() => {})
           }
           return
         }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest && !sameConnectRequest(pendingRequest, request)) {
-          if (!isConnectionReferencedLocally(connectionId)) {
+          if (
+            !ownedReplacementId &&
+            !isConnectionReferencedLocally(connectionId)
+          ) {
             acpDisconnect(connectionId).catch(() => {})
           }
           return
