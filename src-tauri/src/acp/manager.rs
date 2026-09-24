@@ -2493,10 +2493,14 @@ impl ConnectionManager {
                         };
                         sibling.insert(txn).await?.id
                     };
-                    if !original_alias
-                        .as_ref()
-                        .is_some_and(|alias| alias.conversation_id != conversation_id)
+                    if !current_is_forked
+                        && !original_alias
+                            .as_ref()
+                            .is_some_and(|alias| alias.conversation_id != conversation_id)
                     {
+                        // Only the first fork writer still holds S1 here.
+                        // When lifecycle already split S1, any aliases left
+                        // on the active row belong to S2, not the sibling.
                         conversation_external_alias::Entity::update_many()
                             .col_expr(
                                 conversation_external_alias::Column::ConversationId,
@@ -7942,6 +7946,109 @@ mod tests {
                 .message,
             "new fork error",
             "late S1 errors and fork finalization must not replace S2's error"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_keeps_new_session_alias_when_old_session_has_no_alias() {
+        use crate::acp::session_state::SessionLastError;
+        use crate::db::test_helpers;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/fork-new-alias-only").await;
+        let active = conversation_service::create(
+            &db.conn, folder, AgentType::Gemini, None, None,
+        )
+        .await
+        .unwrap();
+        conversation_service::bind_external_id(&db.conn, active.id, "S1", &[])
+            .await
+            .unwrap();
+        let preserved = conversation_service::bind_external_id(
+            &db.conn, active.id, "S2", &[],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        conversation_service::renormalize_external_id_alias(
+            &db.conn, active.id, Some("S2"), "parser-S2".into(),
+        )
+        .await
+        .unwrap();
+
+        let adopted = ConnectionManager::persist_fork_outcome(
+            &db.conn, active.id, "S2".into(), "S1".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(adopted, preserved);
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, active.id)
+                .await
+                .unwrap()
+                .external_id
+                .as_deref(),
+            Some("parser-S2")
+        );
+        assert_eq!(
+            conversation_service::persist_last_error_for_agent_session(
+                &db.conn,
+                AgentType::Gemini,
+                "S2",
+                "new-live",
+                10,
+                Some(&SessionLastError {
+                    message: "new session error".into(),
+                    code: None,
+                    details: None,
+                }),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, active.id)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "new session error",
+            "S2's alias must remain on the active row"
+        );
+        assert!(
+            conversation_service::get_last_error(&db.conn, preserved)
+                .await
+                .unwrap()
+                .0
+                .is_none()
+        );
+        assert_eq!(
+            conversation_service::persist_last_error_for_agent_session(
+                &db.conn,
+                AgentType::Gemini,
+                "S1",
+                "old-live",
+                11,
+                Some(&SessionLastError {
+                    message: "old session error".into(),
+                    code: None,
+                    details: None,
+                }),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, preserved)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "old session error"
         );
     }
 

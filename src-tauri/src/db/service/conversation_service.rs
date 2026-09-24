@@ -3803,6 +3803,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_parser_branch_without_alias_keeps_its_known_load_identity() {
+        use crate::acp::session_state::SessionLastError;
+        use sea_orm::sea_query::Expr;
+
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/legacy-parser-alias").await;
+        let row = create(&db.conn, folder, AgentType::Gemini, None, None)
+            .await
+            .unwrap();
+        // Pre-migration releases rewrote external_id but retained no ACP UUID.
+        conversation::Entity::update_many()
+            .col_expr(
+                conversation::Column::ExternalId,
+                Expr::value("parser-branch"),
+            )
+            .filter(conversation::Column::Id.eq(row.id))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        assert!(
+            bind_external_id(&db.conn, row.id, "parser-branch", &[])
+                .await
+                .unwrap()
+                .is_none(),
+            "session/load emits the requested parser id, so no split occurs"
+        );
+        assert!(
+            bind_external_id(
+                &db.conn,
+                row.id,
+                "fresh-acp-id",
+                &["parser-branch".into()],
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a declared continuation stays on the historical row"
+        );
+        assert_eq!(
+            persist_last_error_for_agent_session(
+                &db.conn,
+                AgentType::Gemini,
+                "fresh-acp-id",
+                "new-live",
+                10,
+                Some(&SessionLastError {
+                    message: "fallback failed".into(),
+                    code: None,
+                    details: None,
+                }),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            get_last_error(&db.conn, row.id)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "fallback failed"
+        );
+    }
+
+    #[tokio::test]
     async fn binding_refuses_a_session_spelling_reserved_as_another_rows_alias() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/acp-alias-claim").await;
