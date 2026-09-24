@@ -246,6 +246,32 @@ pub async fn set_last_error(
     Ok(())
 }
 
+/// Accept a connect-time hint only when the selected row owns the requested
+/// agent session. This avoids storing an early load failure on another
+/// conversation of the same agent. A history load has a session id; fresh
+/// sessions cannot be associated until ConversationLinked fires.
+pub async fn resolve_error_conversation_hint(
+    conn: &DatabaseConnection,
+    conversation_id: Option<i32>,
+    agent_type: AgentType,
+    session_id: Option<&str>,
+) -> Result<Option<i32>, DbError> {
+    let (Some(conversation_id), Some(session_id)) = (conversation_id, session_id) else {
+        return Ok(None);
+    };
+    let row = conversation::Entity::find_by_id(conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?;
+    let expected_agent = agent_type.as_wire();
+    Ok(row
+        .filter(|row| {
+            row.agent_type == expected_agent.as_ref()
+                && row.external_id.as_deref() == Some(session_id)
+        })
+        .map(|row| row.id))
+}
+
 pub async fn get_last_error(
     conn: &DatabaseConnection,
     conversation_id: i32,
@@ -3500,6 +3526,64 @@ mod tests {
             "loop row must be excluded"
         );
     }
+    #[tokio::test]
+    async fn error_hint_requires_matching_live_agent_session() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/acp-error-hint").await;
+        let row = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap();
+        let unrelated = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .unwrap();
+        bind_external_id(&db.conn, row.id, "session-A", &[])
+            .await
+            .unwrap();
+        bind_external_id(&db.conn, unrelated.id, "session-B", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_error_conversation_hint(
+                &db.conn, Some(row.id), AgentType::ClaudeCode, Some("session-A")
+            )
+            .await
+            .unwrap(),
+            Some(row.id)
+        );
+        assert_eq!(
+            resolve_error_conversation_hint(
+                &db.conn, Some(unrelated.id), AgentType::ClaudeCode, Some("session-A")
+            )
+            .await
+            .unwrap(),
+            None,
+            "an unrelated same-agent row must not receive this load error"
+        );
+        assert_eq!(
+            resolve_error_conversation_hint(
+                &db.conn, Some(row.id), AgentType::Codex, Some("session-A")
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_error_conversation_hint(&db.conn, Some(row.id), AgentType::ClaudeCode, None)
+                .await
+                .unwrap(),
+            None
+        );
+        soft_delete(&db.conn, row.id).await.unwrap();
+        assert_eq!(
+            resolve_error_conversation_hint(
+                &db.conn, Some(row.id), AgentType::ClaudeCode, Some("session-A")
+            )
+            .await
+            .unwrap(),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn last_error_survives_database_reopen_and_clears_only_for_its_conversation() {
         use crate::acp::session_state::SessionLastError;

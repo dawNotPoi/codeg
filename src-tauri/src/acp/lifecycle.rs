@@ -1551,17 +1551,9 @@ async fn connection_worker_loop(
                 conversation_id, ..
             } => {
                 try_cache_link(&mut cache, &manager, &connection_id, *conversation_id).await;
-                // The row is now owned by this connection even if session/load
-                // rejects before StatusChanged(Prompting) can fire.
-                persist_last_error_for_connection(
-                    &db,
-                    &cache,
-                    &manager,
-                    &connection_id,
-                    work.scope_sequence,
-                    None,
-                )
-                .await;
+                // Linking alone does not begin a new turn. A history fork can
+                // link before attempting fork; leave its old error intact if
+                // that attempt fails. Prompting is the clear boundary.
             }
             AcpEvent::StatusChanged {
                 status: ConnectionStatus::Prompting,
@@ -1681,11 +1673,13 @@ async fn persist_last_error_for_connection(
             .get(connection_id)
             .map(|entry| entry.conversation_id)
             .or(state.conversation_id)
+            .or(state.pending_error_conversation_id)
     };
     let Some(cid) = cid else {
         return;
     };
-    for attempt in 0..=HANDLE_EVENT_RETRY_BACKOFFS.len() {
+    let mut retry_backoffs = HANDLE_EVENT_RETRY_BACKOFFS.iter();
+    loop {
         let result = match error {
             Some(error) => {
                 // An Error can arrive before the first Prompting event (for
@@ -1721,15 +1715,15 @@ async fn persist_last_error_for_connection(
         };
         match result {
             Ok(()) => return,
-            Err(e) => {
-                if attempt == HANDLE_EVENT_RETRY_BACKOFFS.len() {
+            Err(e) => match retry_backoffs.next() {
+                Some(backoff) => tokio::time::sleep(*backoff).await,
+                None => {
                     tracing::error!(
                         "[lifecycle][ERROR] persist last_error for conversation {cid}: {e}"
                     );
                     return;
                 }
-                tokio::time::sleep(HANDLE_EVENT_RETRY_BACKOFFS[attempt]).await;
-            }
+            },
         }
     }
 }
@@ -2465,6 +2459,150 @@ mod tests {
         conversation_id: i32,
     ) {
         try_cache_link(cache, manager, connection_id, conversation_id).await;
+    }
+
+    #[tokio::test]
+    async fn worker_persists_pre_prompt_load_error_for_known_history_row() {
+        use crate::db::test_helpers::fresh_disk_db;
+        use sea_orm::Database;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_disk_db(dir.path()).await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/acp-history-load").await;
+        let conv = conversation_service::create(
+            &db.conn, folder, AgentType::ClaudeCode, None, None,
+        )
+        .await
+        .unwrap();
+        let mgr = ConnectionManager::new();
+        let connection = fake_connection_with_state("history-load", None);
+        connection
+            .state
+            .write()
+            .await
+            .pending_error_conversation_id = Some(conv.id);
+        mgr.connections
+            .lock()
+            .await
+            .insert("history-load".into(), connection);
+
+        let (tx, rx) = mpsc::channel(8);
+        let worker = tokio::spawn(connection_worker_loop(
+            "history-load".into(),
+            db.conn.clone(),
+            mgr.clone_ref(),
+            None,
+            rx,
+        ));
+        tx.send(LifecycleWork {
+            envelope: Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "history-load".into(),
+                payload: AcpEvent::Error {
+                    message: "Failed to load session, starting new".into(),
+                    agent_type: "claude_code".into(),
+                    code: Some("load_failed".into()),
+                    details: None,
+                    terminal: false,
+                },
+            }),
+            scope_sequence: 1,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        worker.await.unwrap();
+        assert!(mgr
+            .get_state("history-load")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .conversation_id
+            .is_none());
+        db.conn.close().await.unwrap();
+
+        let reopened = Database::connect(format!(
+            "sqlite:{}?mode=rw",
+            dir.path().join("source.db").display()
+        ))
+        .await
+        .unwrap();
+        let (error, _) = conversation_service::get_last_error(&reopened, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            error.unwrap().message,
+            "Failed to load session, starting new"
+        );
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conversation_link_without_prompt_preserves_previous_error() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/acp-failed-fork").await;
+        let conv = conversation_service::create(
+            &db.conn, folder, AgentType::ClaudeCode, None, None,
+        )
+        .await
+        .unwrap();
+        conversation_service::begin_error_scope(&db.conn, conv.id, "previous", 1)
+            .await
+            .unwrap();
+        conversation_service::set_last_error(
+            &db.conn,
+            conv.id,
+            "previous",
+            1,
+            &SessionLastError {
+                message: "previous failure".into(),
+                code: None,
+                details: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConnectionManager::new();
+        mgr.connections.lock().await.insert(
+            "failed-fork".into(),
+            fake_connection_with_state("failed-fork", None),
+        );
+        let (tx, rx) = mpsc::channel(8);
+        let worker = tokio::spawn(connection_worker_loop(
+            "failed-fork".into(),
+            db.conn.clone(),
+            mgr.clone_ref(),
+            None,
+            rx,
+        ));
+        tx.send(LifecycleWork {
+            envelope: Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "failed-fork".into(),
+                payload: AcpEvent::ConversationLinked {
+                    conversation_id: conv.id,
+                    folder_id: folder,
+                    parent_conversation_id: None,
+                    parent_tool_use_id: None,
+                },
+            }),
+            scope_sequence: 2,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        worker.await.unwrap();
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, conv.id)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .message,
+            "previous failure"
+        );
     }
 
     #[tokio::test]
