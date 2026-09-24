@@ -125,7 +125,7 @@ describe("persisted ACP error alert reconciliation", () => {
     }
   }
 
-  it("keeps one Alert through live error, DB refetch, and in-place reconnect", () => {
+  it("keeps one Alert through live error, S1 split, detail refetch, dismissal, and reconnect", () => {
     const { unmount } = mount()
     const tracker = persistedConversationErrorAlertTracker
     act(() =>
@@ -137,6 +137,10 @@ describe("persisted ACP error alert reconciliation", () => {
       })
     )
     const detail = savedError(4, "live-conn", "transport stopped")
+    const preservedDetail = {
+      ...detail,
+      summary: { id: 18 } as DbConversationDetail["summary"],
+    }
     expect(
       selectPersistedConversationErrorAlert({
         conversationId: 17,
@@ -147,8 +151,8 @@ describe("persisted ACP error alert reconciliation", () => {
       })
     ).toBeNull()
     const recovered = selectPersistedConversationErrorAlert({
-      conversationId: 17,
-      detail,
+      conversationId: 18,
+      detail: preservedDetail,
       liveError: null,
       status: "connected",
       retiredRevision: null,
@@ -179,11 +183,23 @@ describe("persisted ACP error alert reconciliation", () => {
     const liveId = probe.alerts[0].id
     act(() => probe.dismiss?.(liveId))
     expect(probe.alerts.map((a) => a.key)).toEqual(["unrelated"])
-    expect(tracker.wasLiveNotified(recovered)).toBe(true)
+    const afterDismiss = selectPersistedConversationErrorAlert({
+      conversationId: 18,
+      detail: preservedDetail,
+      liveError: null,
+      status: "connected",
+      retiredRevision: null,
+    })!
+    expect(afterDismiss.key).toBe("acp-error:live-conn:process_exited")
+    expect(tracker.claim(afterDismiss.revisionKey)).toBe(false)
+    expect(tracker.wasLiveNotified(afterDismiss)).toBe(true)
 
     const otherClient = selectPersistedConversationErrorAlert({
-      conversationId: 17,
-      detail: savedError(5, "other-conn", "other client failed"),
+      conversationId: 18,
+      detail: {
+        ...savedError(5, "other-conn", "other client failed"),
+        summary: { id: 18 } as DbConversationDetail["summary"],
+      },
       liveError: null,
       status: "connected",
       retiredRevision: null,
@@ -205,9 +221,13 @@ describe("persisted ACP error alert reconciliation", () => {
 
   it("restores one historical Alert on cold load without replaying a toast", () => {
     const { unmount } = mount()
+    const preservedDetail = {
+      ...savedError(6, "previous-process", "previous failure"),
+      summary: { id: 18 } as DbConversationDetail["summary"],
+    }
     const alert = selectPersistedConversationErrorAlert({
-      conversationId: 17,
-      detail: savedError(6, "previous-process", "previous failure"),
+      conversationId: 18,
+      detail: preservedDetail,
       liveError: null,
       status: "disconnected",
       retiredRevision: null,
