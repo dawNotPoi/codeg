@@ -5298,6 +5298,59 @@ mod tests {
         assert!(matches!(reconnect, Err(AcpError::SdkNotInstalled(_))));
     }
 
+    /// A terminal Error can finish lifecycle work before the driver's later
+    /// StatusChanged(Error) or map cleanup. Restart must treat the first event
+    /// as terminal instead of registering a waiter after its only callback.
+    #[tokio::test]
+    async fn terminal_error_before_restart_reservation_cannot_strand_quarantine() {
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("old", AgentType::Antigravity, None, EventEmitter::Noop)
+            .await;
+        let state = mgr.get_state("old").await.unwrap();
+        state.write().await.external_id = Some("same-session".into());
+        let pid = mgr.connections.lock().await.get("old").unwrap().child_pid.clone();
+        pid.store(42, Ordering::SeqCst);
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *mgr.restart_before_reservation_hook.lock().await = Some((reached_tx, resume_rx));
+        let restart_mgr = mgr.clone_ref();
+        let mut restart = tokio::spawn(async move {
+            restart_mgr.disconnect_for_restart("old", "test-window").await
+        });
+        tokio::time::timeout(Duration::from_secs(2), reached_rx)
+            .await
+            .expect("restart reached reservation gap")
+            .expect("restart hook closed");
+
+        emit_with_state(
+            &state,
+            &EventEmitter::Noop,
+            AcpEvent::Error {
+                message: "driver failed".into(),
+                agent_type: "antigravity".into(),
+                code: None,
+                details: None,
+                terminal: true,
+            },
+        )
+        .await;
+        // This is the lifecycle worker's one terminal callback. The driver
+        // has not yet emitted StatusChanged(Error) or removed the map entry.
+        mgr.complete_restart_terminal("old", Ok(())).await;
+        resume_tx.send(()).expect("resume restart");
+        let outcome = tokio::time::timeout(Duration::from_millis(300), &mut restart).await;
+        if outcome.is_err() {
+            restart.abort(); // do not signal the fake PID on the old code
+        }
+        let result = outcome
+            .expect("restart must reject the already-terminal connection promptly")
+            .expect("restart task");
+        assert!(matches!(result, Err(AcpError::Protocol(_))));
+        assert!(mgr.get_state("old").await.is_some());
+        assert!(mgr.restart_quarantines.lock().await.is_empty());
+        assert!(mgr.restart_terminal_waiters.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn restart_rejects_non_owner_and_missing_session_without_teardown() {
         let mgr = ConnectionManager::new();
