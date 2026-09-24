@@ -2989,6 +2989,8 @@ export interface AcpActionsValue {
    * restart to the user gate on it; fire-and-forget teardowns ignore it.
    */
   disconnect(contextKey: string): Promise<boolean>
+  /** Invalidate a pending restart when its visible surface unmounts. */
+  releaseRestartingSurface(contextKey: string): boolean
   /**
    * Release a connection whose SURFACE went away on its own (a preview tab
    * replaced by the next single-click in the sidebar) — never a user-intent
@@ -3430,6 +3432,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // A confirmed backend restart owns this key until its replacement has
   // attached locally. Other connect attempts cannot steal its route.
   const restartingKeysRef = useRef(new Set<string>())
+  // Closing a surface invalidates any restart that started while it was open.
+  // A new surface may reuse the same context key and even the same backend ID,
+  // so comparing IDs alone cannot distinguish it from the old owner.
+  const surfaceGenerationRef = useRef(new Map<string, number>())
+  const restartGenerationRef = useRef(new Map<string, number>())
+  const restartPendingConnectsRef = useRef(
+    new Map<string, { generation: number; request: ConnectRequest }>()
+  )
   const pendingConnectRequestsRef = useRef(new Map<string, ConnectRequest>())
   // Last params `connect()` was called with, per contextKey — kept AFTER the
   // connection is gone (teardown removes the store entry entirely, so a
@@ -6029,6 +6039,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const reverseMap = reverseMapRef.current
     const attachSubs = attachSubscriptionsRef.current
+    const restartingKeys = restartingKeysRef.current
+    const surfaceGenerations = surfaceGenerationRef.current
+    const restartPendingConnects = restartPendingConnectsRef.current
     // Capture the store ref at effect-setup time so the cleanup
     // function doesn't read a moving target (`storeRef.current` is the
     // same object across renders by design, but the lint rule
@@ -6036,6 +6049,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     // because in the general case a ref's `.current` can be replaced).
     const store = storeRef.current
     return () => {
+      // A provider teardown must not let a late restart response attach a
+      // connection to this now-unmounted provider, even if its old entry was
+      // already removed by the backend's terminal event.
+      for (const key of restartingKeys) {
+        surfaceGenerations.set(key, (surfaceGenerations.get(key) ?? 0) + 1)
+      }
+      restartPendingConnects.clear()
       // A connection can be routed by several surfaces (see `reverseMapRef`);
       // tear it down at most once, and only if at least one of them OWNS it.
       const alreadyTornDown = new Set<string>()
@@ -6236,14 +6256,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       conversationId?: number,
       ownedReplacementId?: string
     ) => {
-      if (restartingKeysRef.current.has(contextKey) && !ownedReplacementId) {
-        return
-      }
       const request: ConnectRequest = {
         agentType,
         workingDir,
         sessionId,
         conversationId,
+      }
+      if (restartingKeysRef.current.has(contextKey) && !ownedReplacementId) {
+        const generation = surfaceGenerationRef.current.get(contextKey) ?? 0
+        if (generation !== restartGenerationRef.current.get(contextKey)) {
+          // This is a newly opened surface, not another connect from the old
+          // restart owner. Replay after the backend has released its session
+          // lock so normal dedup attaches to its one replacement process.
+          restartPendingConnectsRef.current.set(contextKey, {
+            generation,
+            request,
+          })
+        }
+        return
       }
       // Remember BEFORE the in-flight early return and before the preflight can
       // throw: a connect that never produced a store entry is precisely when
@@ -6820,6 +6850,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const disconnect = useCallback(
     async (contextKey: string): Promise<boolean> => {
+      surfaceGenerationRef.current.set(
+        contextKey,
+        (surfaceGenerationRef.current.get(contextKey) ?? 0) + 1
+      )
+      restartPendingConnectsRef.current.delete(contextKey)
       pendingConnectRequestsRef.current.delete(contextKey)
       // Whatever the surface does next — close, switch agent, reconnect — the
       // last attempt's failure no longer describes it.
@@ -6904,6 +6939,19 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     ]
   )
 
+  const releaseRestartingSurface = useCallback(
+    (contextKey: string): boolean => {
+      if (!restartingKeysRef.current.has(contextKey)) return false
+      surfaceGenerationRef.current.set(
+        contextKey,
+        (surfaceGenerationRef.current.get(contextKey) ?? 0) + 1
+      )
+      restartPendingConnectsRef.current.delete(contextKey)
+      return true
+    },
+    []
+  )
+
   // Lifecycle release for a surface that vanished on its own — currently the
   // preview tab replaced by the next single-click in the sidebar. `disconnect`
   // stays unconditional because its other callers express user INTENT (agent
@@ -6914,6 +6962,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // longer in `openTabKeys`, so nothing else keeps it alive.
   const disconnectIfIdle = useCallback(
     async (contextKey: string) => {
+      // A preview replaced during an explicit restart is gone for good. The
+      // old prompting process is already being stopped by the backend, so
+      // drop this local route instead of letting its completion reattach it.
+      if (restartingKeysRef.current.has(contextKey)) {
+        await disconnect(contextKey)
+        return
+      }
       const conn = storeRef.current.connections.get(contextKey)
       // Owners only: a viewer's disconnect just detaches (it never
       // acpDisconnects), and leaving one attached would leak its subscription
@@ -7085,6 +7140,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (connectingKeysRef.current.has(contextKey)) return false
       if (restartingKeysRef.current.has(contextKey)) return false
       restartingKeysRef.current.add(contextKey)
+      const generation = surfaceGenerationRef.current.get(contextKey) ?? 0
+      restartGenerationRef.current.set(contextKey, generation)
       try {
         const conn = storeRef.current.connections.get(contextKey)
         if (
@@ -7105,6 +7162,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           prefs.modeId,
           prefs.configValues
         )
+        const current = storeRef.current.connections.get(contextKey)
+        if (
+          (surfaceGenerationRef.current.get(contextKey) ?? 0) !== generation ||
+          (current && current.connectionId !== conn.connectionId)
+        ) {
+          // The surface was closed or replaced while the backend completed
+          // its independent, safety-gated restart. Leave that one backend
+          // process available for an explicit/new-surface dedup connect.
+          return false
+        }
         try {
           // Local viewer tabs may not have received the old terminal event.
           // Retire their old routes before the owner attaches the replacement.
@@ -7118,7 +7185,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           }
           // The old backend entry is now gone. This releases the owner's old
           // local route; ConnectionNotFound cannot kill the new connection.
+          // Mark the expected generation of this intentional local teardown.
+          // A tab close during its await increments it again and must prevent
+          // the subsequent attach just as a close during acpRestart does.
+          restartGenerationRef.current.set(contextKey, generation + 1)
           await disconnect(contextKey)
+          if (
+            (surfaceGenerationRef.current.get(contextKey) ?? 0) !==
+            generation + 1
+          ) {
+            return false
+          }
           await connect(
             contextKey,
             request.agentType,
@@ -7138,6 +7215,30 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         return true
       } finally {
         restartingKeysRef.current.delete(contextKey)
+        restartGenerationRef.current.delete(contextKey)
+        const pending = restartPendingConnectsRef.current.get(contextKey)
+        restartPendingConnectsRef.current.delete(contextKey)
+        if (
+          pending &&
+          pending.generation ===
+            (surfaceGenerationRef.current.get(contextKey) ?? 0)
+        ) {
+          const { agentType, workingDir, sessionId, conversationId } =
+            pending.request
+          // A reopened tab must not lose its connect behind the old restart
+          // gate. Its normal connect deduplicates against the new backend PID.
+          try {
+            await connectRef.current?.(
+              contextKey,
+              agentType,
+              workingDir,
+              sessionId,
+              conversationId
+            )
+          } catch {
+            // connect() publishes the reopened surface's own failure.
+          }
+        }
       }
     },
     [
@@ -7168,7 +7269,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const disconnectAll = useCallback(async () => {
     const promises: Promise<void>[] = []
     pendingConnectRequestsRef.current.clear()
+    restartPendingConnectsRef.current.clear()
+    for (const key of restartingKeysRef.current) {
+      surfaceGenerationRef.current.set(
+        key,
+        (surfaceGenerationRef.current.get(key) ?? 0) + 1
+      )
+    }
     for (const [contextKey, conn] of storeRef.current.connections) {
+      surfaceGenerationRef.current.set(
+        contextKey,
+        (surfaceGenerationRef.current.get(contextKey) ?? 0) + 1
+      )
       // Viewers attach to a connection another client owns — detach our
       // read-only subscription but never acpDisconnect (that would kill the
       // owner's agent). Owners are torn down normally.
@@ -7538,6 +7650,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     () => ({
       connect,
       disconnect,
+      releaseRestartingSurface,
       disconnectIfIdle,
       disconnectAll,
       sendPrompt,
@@ -7567,6 +7680,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [
       connect,
       disconnect,
+      releaseRestartingSurface,
       disconnectIfIdle,
       disconnectAll,
       sendPrompt,
