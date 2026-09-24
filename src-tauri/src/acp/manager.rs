@@ -433,6 +433,12 @@ fn prune_reaped(draining: &mut DrainingChildren) {
     });
 }
 
+#[cfg(test)]
+type RestartAfterSpawnHook = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
     /// Connections whose teardown was requested but whose child process has
@@ -468,6 +474,8 @@ pub struct ConnectionManager {
     /// connected.
     spawn_locks: Arc<Mutex<HashMap<SpawnDedupKey, Arc<Mutex<()>>>>>,
     restart_quarantines: Arc<Mutex<HashMap<SpawnDedupKey, Arc<RestartQuarantine>>>>,
+    #[cfg(test)]
+    restart_after_spawn_hook: Arc<Mutex<Option<RestartAfterSpawnHook>>>,
     /// One-shot acknowledgements from the per-connection lifecycle worker.
     /// A restart registers before requesting disconnect, so a late old
     /// terminal event cannot cancel the replacement turn.
@@ -548,6 +556,8 @@ impl ConnectionManager {
             draining: Arc::new(Mutex::new(Vec::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             restart_quarantines: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            restart_after_spawn_hook: Arc::new(Mutex::new(None)),
             restart_terminal_waiters: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
@@ -567,6 +577,8 @@ impl ConnectionManager {
             draining: self.draining.clone(),
             spawn_locks: self.spawn_locks.clone(),
             restart_quarantines: self.restart_quarantines.clone(),
+            #[cfg(test)]
+            restart_after_spawn_hook: self.restart_after_spawn_hook.clone(),
             restart_terminal_waiters: self.restart_terminal_waiters.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
             terminal_shell_config: self.terminal_shell_config.clone(),
@@ -622,6 +634,7 @@ impl ConnectionManager {
             draining: Arc::new(Mutex::new(Vec::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             restart_quarantines: Arc::new(Mutex::new(HashMap::new())),
+            restart_after_spawn_hook: Arc::new(Mutex::new(None)),
             restart_terminal_waiters: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: timeout,
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
@@ -799,7 +812,7 @@ impl ConnectionManager {
         // installs the SessionStarted dedup signal on the state, registers
         // a cleanup hook, and returns the rx half of the signal. Any spawn
         // failure short-circuits before we touch the rx wait.
-        let session_started_rx = spawn_agent_connection(
+        let (session_started_rx, _child_pid) = spawn_agent_connection(
             connection_id.clone(),
             agent_type,
             working_dir,
@@ -2687,12 +2700,12 @@ impl ConnectionManager {
         {
             let mut state = quarantine.state.lock().await;
             state.connection_id = replacement_id.clone();
-            // Unknown until spawn_agent_connection publishes its pid cell.
+            // Unknown until spawn_agent_connection returns its pid cell.
             // Treat a cancelled spawn as unsafe rather than assuming no child.
             state.child_pid = None;
             state.terminal = 0;
         }
-        let started = match spawn_agent_connection(
+        let (started, child_pid) = match spawn_agent_connection(
             replacement_id.clone(),
             agent_type,
             working_dir.map(|dir| dir.to_string_lossy().into_owned()),
@@ -2718,15 +2731,18 @@ impl ConnectionManager {
                 return Err(error);
             }
         };
+        #[cfg(test)]
         {
-            let pid = self
-                .connections
-                .lock()
-                .await
-                .get(&replacement_id)
-                .map(|conn| Arc::clone(&conn.child_pid));
-            quarantine.state.lock().await.child_pid = pid;
+            let hook = self.restart_after_spawn_hook.lock().await.take();
+            if let Some((reached, resume)) = hook {
+                let _ = reached.send(());
+                let _ = resume.await;
+            }
         }
+        // The driver may fail and remove its active-map entry before this
+        // continuation runs. Its returned PID cell remains authoritative
+        // through on_exit/reap, independent of that entry's lifetime.
+        quarantine.state.lock().await.child_pid = Some(child_pid);
         let (outcome, _) =
             wait_for_session_started(started, self.spawn_handshake_timeout).await;
         let resumed = self
@@ -5271,6 +5287,14 @@ mod tests {
         use crate::db::service::conversation_service;
         use crate::db::test_helpers;
 
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("skipping fake ACP process test: python3 is unavailable");
+            return;
+        }
         let _registry_guard = custom_registry::hydrate_test_guard();
         let dir = tempfile::tempdir().expect("tempdir");
         let script = dir.path().join("fake_acp.py");
@@ -5292,6 +5316,8 @@ for line in sys.stdin:
     if method == "initialize":
         result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
     elif method == "session/load":
+        if os.path.exists(os.path.join(os.path.dirname(sys.argv[1]), "exit_on_load")):
+            sys.exit(17)
         if os.path.exists(os.path.join(os.path.dirname(sys.argv[1]), "reject_load")):
             sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "temporary load failure"}}) + "\n")
             sys.stdout.flush()
@@ -5315,7 +5341,7 @@ for line in sys.stdin:
             spec: CustomAgentSpec {
                 npx: Some(NpxSpec {
                     package: "fake-acp@1.0.0".into(),
-                    cmd: Some("/usr/bin/python3".into()),
+                    cmd: Some("python3".into()),
                     args: vec![
                         script.to_string_lossy().into_owned(),
                         pid_file.to_string_lossy().into_owned(),
@@ -5554,6 +5580,89 @@ for line in sys.stdin:
         })
         .await
         .expect("failed replacement was safely finalized");
+
+        // Force the replacement driver to remove its active-map entry before
+        // restart_agent_inner stores its PID cell. The cell returned directly
+        // by spawn_agent_connection must still let quarantine prove reap and
+        // permit a later normal connect to the original session.
+        std::fs::remove_file(dir.path().join("reject_load")).unwrap();
+        let live = mgr
+            .spawn_agent(
+                agent,
+                Some(dir.path().to_string_lossy().into_owned()),
+                Some("restart-session".into()),
+                BTreeMap::new(),
+                "test-window".into(),
+                emitter.clone(),
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .expect("normal connect after failed replacement");
+        std::fs::write(dir.path().join("exit_on_load"), "1").unwrap();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *mgr.restart_after_spawn_hook.lock().await = Some((reached_tx, resume_rx));
+        let fast_manager = mgr.clone_ref();
+        let fast_emitter = emitter.clone();
+        let fast_restart = tokio::spawn(async move {
+            fast_manager
+                .restart_agent(
+                    &live,
+                    "test-window",
+                    "restart-session",
+                    BTreeMap::new(),
+                    fast_emitter,
+                    None,
+                    BTreeMap::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), reached_rx)
+            .await
+            .expect("replacement spawn hook")
+            .expect("replacement spawn reached");
+        let key = SpawnDedupKey {
+            agent_type: agent,
+            working_dir: Some(dir.path().to_path_buf()),
+            session_id: "restart-session".into(),
+        };
+        let fast_quarantine = mgr.restart_quarantines.lock().await.get(&key).cloned().unwrap();
+        let fast_id = fast_quarantine.state.lock().await.connection_id.clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mgr.get_state(&fast_id).await.is_some() {
+            assert!(std::time::Instant::now() < deadline, "fast driver did not clean up");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        resume_tx.send(()).unwrap();
+        assert!(fast_restart.await.unwrap().is_err());
+        mgr.ensure_restart_quarantine_clear(&key)
+            .await
+            .expect("fast failed driver must not strand quarantine");
+        std::fs::remove_file(dir.path().join("exit_on_load")).unwrap();
+        let restored = mgr
+            .spawn_agent(
+                agent,
+                Some(dir.path().to_string_lossy().into_owned()),
+                Some("restart-session".into()),
+                BTreeMap::new(),
+                "test-window".into(),
+                emitter.clone(),
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .expect("ordinary connect recovers after fast failed restart");
+        assert_eq!(
+            mgr.get_state(&restored)
+                .await
+                .unwrap()
+                .read()
+                .await
+                .external_id
+                .as_deref(),
+            Some("restart-session")
+        );
         dispatcher.abort();
         custom_registry::hydrate(&[]);
     }

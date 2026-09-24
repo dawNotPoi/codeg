@@ -1144,6 +1144,114 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
     expect(h.acpConnect).toHaveBeenCalledTimes(1)
   })
 
+  it("does not revive a tab closed while the backend restarts", async () => {
+    await connectOwner()
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    let finishRestart!: (id: string) => void
+    h.acpRestart.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRestart = resolve
+        })
+    )
+    let pendingRestart!: Promise<boolean>
+    act(() => {
+      pendingRestart = h.actions!.restartStalled(TAB)
+    })
+    expect(h.actions!.releaseRestartingSurface(TAB)).toBe(true)
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    let restarted: boolean | undefined
+    await act(async () => {
+      finishRestart("replacement-conn")
+      restarted = await pendingRestart
+    })
+    expect(restarted).toBe(false)
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith("replacement-conn")
+  })
+
+  it("replays a reopened tab's connect after an older restart returns", async () => {
+    await connectOwner()
+    h.acpConnect.mockResolvedValue("replacement-conn")
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    let finishRestart!: (id: string) => void
+    h.acpRestart.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRestart = resolve
+        })
+    )
+    let pendingRestart!: Promise<boolean>
+    act(() => {
+      pendingRestart = h.actions!.restartStalled(TAB)
+    })
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    // The new surface uses the same context key and may deduplicate onto the
+    // replacement process, but the old restart callback cannot own its route.
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    let restarted: boolean | undefined
+    await act(async () => {
+      finishRestart("replacement-conn")
+      restarted = await pendingRestart
+    })
+    expect(restarted).toBe(false)
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("replacement-conn")
+    expect(h.acpConnect).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not attach when the tab closes during local teardown after restart", async () => {
+    await connectOwner()
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    let finishTeardown!: () => void
+    h.acpDisconnect.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishTeardown = resolve
+        })
+    )
+    let pendingRestart!: Promise<boolean>
+    act(() => {
+      pendingRestart = h.actions!.restartStalled(TAB)
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    let restarted: boolean | undefined
+    await act(async () => {
+      finishTeardown()
+      restarted = await pendingRestart
+    })
+    expect(restarted).toBe(false)
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+  })
+
   it("keeps the old connection when backend cannot confirm process teardown", async () => {
     await connectOwner()
     emitAcpEvent(latestAttachHandlers(), {
