@@ -1253,6 +1253,7 @@ impl SessionState {
                 message,
                 code,
                 details,
+                terminal,
                 ..
             } => {
                 // Capture so post-mortem readers (probe path, debug
@@ -1265,6 +1266,13 @@ impl SessionState {
                     code: code.clone(),
                     details: details.clone(),
                 });
+                if *terminal {
+                    // The lifecycle worker may complete its only terminal
+                    // callback before the driver's next StatusChanged(Error).
+                    // Mark the connection terminal while applying this event
+                    // so a concurrent restart cannot register a late waiter.
+                    self.status = ConnectionStatus::Error;
+                }
             }
             AcpEvent::DelegationStarted {
                 parent_tool_use_id,
@@ -3111,6 +3119,27 @@ mod tests {
             !empty_json.contains("pending_user_message"),
             "no-pending snapshot must omit the field"
         );
+    }
+
+    #[test]
+    fn only_terminal_error_changes_live_connection_status() {
+        for live_status in [ConnectionStatus::Connected, ConnectionStatus::Prompting] {
+            let mut state = fresh_state();
+            state.apply_event(&AcpEvent::StatusChanged {
+                status: live_status.clone(),
+            });
+            let error = |terminal| AcpEvent::Error {
+                message: "agent failed".into(),
+                agent_type: "claude_code".into(),
+                code: None,
+                details: None,
+                terminal,
+            };
+            state.apply_event(&error(false));
+            assert_eq!(state.status, live_status);
+            state.apply_event(&error(true));
+            assert_eq!(state.status, ConnectionStatus::Error);
+        }
     }
 
     #[test]
