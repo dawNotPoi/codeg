@@ -828,6 +828,10 @@ export const CANVAS_CHANGED_EVENT = "canvas://changed"
 
 export interface DbConversationDetail {
   summary: DbConversationSummary
+  /** Latest unresolved ACP error persisted on the conversation row. */
+  last_error?: SessionLastError | null
+  /** Monotonic per-conversation revision of persisted error state. */
+  last_error_revision?: number
   turns: MessageTurn[]
   session_stats?: SessionStats | null
   /** See `ConversationDetail.transcript_watermark` (threaded through the DB

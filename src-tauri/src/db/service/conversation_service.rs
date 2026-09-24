@@ -6,6 +6,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
+use crate::acp::session_state::SessionLastError;
 use crate::db::entities::conversation::ConversationKind;
 use crate::db::entities::{conversation, folder};
 use crate::db::error::DbError;
@@ -120,6 +121,10 @@ async fn create_inner(
         deleted_at: Set(None),
         pinned_at: Set(None),
         origin_cwd: Set(None),
+        last_error: Set(None),
+        last_error_connection_id: Set(None),
+        last_error_scope_sequence: Set(0),
+        last_error_revision: Set(0),
     };
     Ok(model.insert(conn).await?)
 }
@@ -160,6 +165,104 @@ pub async fn update_status_if(
         .exec(conn)
         .await?;
     Ok(result.rows_affected > 0)
+}
+
+/// Largest durable sequence from a previous process. The lifecycle dispatcher
+/// advances from this value, so a restart cannot reuse an existing scope.
+pub async fn max_last_error_scope_sequence(conn: &DatabaseConnection) -> Result<i64, DbError> {
+    Ok(conversation::Entity::find()
+        .order_by_desc(conversation::Column::LastErrorScopeSequence)
+        .one(conn)
+        .await?
+        .map(|row| row.last_error_scope_sequence)
+        .unwrap_or(0))
+}
+
+/// Atomically claim a conversation's error scope for a dispatched lifecycle
+/// event. A worker for an earlier event cannot clear a newer prompt's error.
+pub async fn begin_error_scope(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    connection_id: &str,
+    scope_sequence: i64,
+) -> Result<(), DbError> {
+    use sea_orm::sea_query::Expr;
+
+    conversation::Entity::update_many()
+        .col_expr(conversation::Column::LastError, Expr::value(Option::<String>::None))
+        .col_expr(
+            conversation::Column::LastErrorConnectionId,
+            Expr::value(connection_id.to_owned()),
+        )
+        .col_expr(
+            conversation::Column::LastErrorScopeSequence,
+            Expr::value(scope_sequence),
+        )
+        .col_expr(
+            conversation::Column::LastErrorRevision,
+            Expr::col(conversation::Column::LastErrorRevision).add(1),
+        )
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::LastErrorScopeSequence.lte(scope_sequence))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
+/// Persist a failure only while this connection still owns the row's error
+/// scope. Do not bump updated_at: this is diagnostic state, not chat activity.
+pub async fn set_last_error(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    connection_id: &str,
+    scope_sequence: i64,
+    error: &SessionLastError,
+) -> Result<(), DbError> {
+    use sea_orm::sea_query::Expr;
+
+    // The realtime snapshot may carry redacted stderr and diagnostics, but
+    // disk persistence only needs the user-visible message and stable code.
+    // Avoid retaining potentially sensitive details indefinitely in SQLite.
+    let durable = SessionLastError {
+        message: error.message.clone(),
+        code: error.code.clone(),
+        details: None,
+    };
+    let encoded = serde_json::to_string(&durable)
+        .map_err(|e| DbError::Migration(format!("serialize session error: {e}")))?;
+    conversation::Entity::update_many()
+        .col_expr(conversation::Column::LastError, Expr::value(encoded))
+        .col_expr(
+            conversation::Column::LastErrorRevision,
+            Expr::col(conversation::Column::LastErrorRevision).add(1),
+        )
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(conversation::Column::LastErrorConnectionId.eq(connection_id))
+        .filter(conversation::Column::LastErrorScopeSequence.eq(scope_sequence))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_last_error(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<(Option<SessionLastError>, i64), DbError> {
+    let row = conversation::Entity::find_by_id(conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("conversation {conversation_id}")))?;
+    let error = row
+        .last_error
+        .map(|value| {
+            serde_json::from_str(&value)
+                .map_err(|e| DbError::Migration(format!("decode session error: {e}")))
+        })
+        .transpose()?;
+    Ok((error, row.last_error_revision))
 }
 
 /// Manual rename: set the title AND lock it. Once locked, the per-turn
@@ -901,6 +1004,8 @@ struct CarriedOverRow {
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
     origin_cwd: Option<String>,
+    last_error: Option<String>,
+    last_error_revision: i64,
 }
 
 impl CarriedOverRow {
@@ -939,6 +1044,8 @@ impl CarriedOverRow {
             // `origin_cwd ?? folder.path`, so dropping this would break
             // history lookup for a re-parented conversation.
             origin_cwd: row.origin_cwd.clone(),
+            last_error: row.last_error.clone(),
+            last_error_revision: row.last_error_revision,
         }
     }
 
@@ -968,6 +1075,10 @@ impl CarriedOverRow {
             // not to the history.
             pinned_at: Set(None),
             origin_cwd: Set(self.origin_cwd),
+            last_error: Set(self.last_error),
+            last_error_connection_id: Set(None),
+            last_error_scope_sequence: Set(0),
+            last_error_revision: Set(self.last_error_revision),
         }
     }
 }
@@ -3389,4 +3500,75 @@ mod tests {
             "loop row must be excluded"
         );
     }
+    #[tokio::test]
+    async fn last_error_survives_database_reopen_and_clears_only_for_its_conversation() {
+        use crate::acp::session_state::SessionLastError;
+        use crate::db::test_helpers::fresh_disk_db;
+        use sea_orm::Database;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = fresh_disk_db(dir.path()).await;
+        let folder = seed_folder(&db, "/tmp/codeg-last-error").await;
+        let failed = create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .expect("failed conversation");
+        let healthy = create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .expect("healthy conversation");
+        let error = SessionLastError {
+            message: "gateway refused".into(),
+            code: Some("forbidden".into()),
+            details: Some("redacted evidence".into()),
+        };
+        begin_error_scope(&db.conn, failed.id, "old-connection", 1)
+            .await
+            .expect("claim error scope");
+        set_last_error(&db.conn, failed.id, "old-connection", 1, &error)
+            .await
+            .expect("persist error");
+        db.conn.close().await.expect("close original connection");
+
+        let path = dir.path().join("source.db");
+        let reopened = Database::connect(format!("sqlite:{}?mode=rw", path.display()))
+            .await
+            .expect("reopen database");
+        assert_eq!(
+            get_last_error(&reopened, failed.id).await.expect("read error").0,
+            Some(SessionLastError { details: None, ..error.clone() })
+        );
+        assert_eq!(
+            get_last_error(&reopened, healthy.id).await.expect("read other").0,
+            None
+        );
+        begin_error_scope(
+            &reopened,
+            failed.id,
+            "new-connection",
+            2,
+        )
+            .await
+            .expect("clear error on next prompt");
+        set_last_error(&reopened, failed.id, "old-connection", 1, &error)
+            .await
+            .expect("late old error ignored");
+        assert_eq!(get_last_error(&reopened, failed.id).await.unwrap().0, None);
+        begin_error_scope(&reopened, failed.id, "old-connection", 1)
+            .await
+            .expect("late old scope ignored");
+        assert_eq!(get_last_error(&reopened, failed.id).await.unwrap().0, None);
+        // The older Web tab may legitimately send another prompt later.
+        begin_error_scope(&reopened, failed.id, "old-connection", 3)
+            .await
+            .expect("older connection starts a later prompt");
+        set_last_error(&reopened, failed.id, "old-connection", 3, &error)
+            .await
+            .expect("new failure belongs to the later prompt");
+        assert_eq!(
+            get_last_error(&reopened, failed.id).await.unwrap().0,
+            Some(SessionLastError { details: None, ..error })
+        );
+        assert_eq!(max_last_error_scope_sequence(&reopened).await.unwrap(), 3);
+        reopened.close().await.expect("close reopened connection");
+    }
+
 }
