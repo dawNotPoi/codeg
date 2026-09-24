@@ -1190,6 +1190,8 @@ struct CarriedOverRow {
     updated_at: chrono::DateTime<Utc>,
     origin_cwd: Option<String>,
     last_error: Option<String>,
+    last_error_connection_id: Option<String>,
+    last_error_scope_sequence: i64,
     last_error_revision: i64,
 }
 
@@ -1230,6 +1232,8 @@ impl CarriedOverRow {
             // history lookup for a re-parented conversation.
             origin_cwd: row.origin_cwd.clone(),
             last_error: row.last_error.clone(),
+            last_error_connection_id: row.last_error_connection_id.clone(),
+            last_error_scope_sequence: row.last_error_scope_sequence,
             last_error_revision: row.last_error_revision,
         }
     }
@@ -1261,8 +1265,8 @@ impl CarriedOverRow {
             pinned_at: Set(None),
             origin_cwd: Set(self.origin_cwd),
             last_error: Set(self.last_error),
-            last_error_connection_id: Set(None),
-            last_error_scope_sequence: Set(0),
+            last_error_connection_id: Set(self.last_error_connection_id),
+            last_error_scope_sequence: Set(self.last_error_scope_sequence),
             last_error_revision: Set(self.last_error_revision),
         }
     }
@@ -4076,6 +4080,87 @@ mod tests {
         .unwrap();
         assert_eq!(changed, 0);
         assert!(get_last_error(&db.conn, row.id).await.unwrap().0.is_none());
+    }
+
+    #[tokio::test]
+    async fn split_preserves_error_identity_and_scope_on_the_old_session() {
+        use crate::db::test_helpers::fresh_disk_db;
+        use sea_orm::Database;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_disk_db(dir.path()).await;
+        let folder = seed_folder(&db, "/tmp/error-split-identity").await;
+        let active = create(&db.conn, folder, AgentType::Gemini, None, None)
+            .await
+            .unwrap();
+        bind_external_id(&db.conn, active.id, "S1", &[])
+            .await
+            .unwrap();
+        let old_error = SessionLastError {
+            message: "S1 failed".into(),
+            code: Some("process_exited".into()),
+            details: None,
+        };
+        assert_eq!(
+            persist_last_error_for_agent_session(
+                &db.conn,
+                AgentType::Gemini,
+                "S1",
+                "S1-connection",
+                10,
+                Some(&old_error),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let sibling = bind_external_id(&db.conn, active.id, "S2", &[])
+            .await
+            .unwrap()
+            .expect("S1 preserved");
+        db.conn.close().await.unwrap();
+        let path = dir.path().join("source.db");
+        let reopened = Database::connect(format!("sqlite:{}?mode=rw", path.display()))
+            .await
+            .unwrap();
+        let saved = get_last_error(&reopened, sibling).await.unwrap();
+        assert_eq!(saved.0, Some(old_error.clone()));
+        assert_eq!(saved.2.as_deref(), Some("S1-connection"));
+        assert!(get_last_error(&reopened, active.id).await.unwrap().0.is_none());
+        assert_eq!(
+            persist_last_error_for_agent_session(
+                &reopened,
+                AgentType::Gemini,
+                "S1",
+                "stale-connection",
+                9,
+                Some(&SessionLastError {
+                    message: "stale error".into(),
+                    code: None,
+                    details: None,
+                }),
+            )
+            .await
+            .unwrap(),
+            0,
+            "an older event cannot overwrite S1 after its row is split"
+        );
+        assert_eq!(get_last_error(&reopened, sibling).await.unwrap().0, Some(old_error));
+        assert_eq!(
+            persist_last_error_for_agent_session(
+                &reopened,
+                AgentType::Gemini,
+                "S1",
+                "new-S1-prompt",
+                11,
+                None,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(get_last_error(&reopened, sibling).await.unwrap().0.is_none());
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]

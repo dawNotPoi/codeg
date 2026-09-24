@@ -2316,6 +2316,7 @@ impl ConnectionManager {
                     // eligible for later backfills.
                     let title_locked = current.title_locked;
                     let old_error = current.last_error.clone();
+                    let old_error_connection_id = current.last_error_connection_id.clone();
                     let old_error_revision = current.last_error_revision;
                     let old_error_scope_sequence = current.last_error_scope_sequence;
                     let original_alias = conversation_external_alias::Entity::find()
@@ -2487,7 +2488,15 @@ impl ConnectionManager {
                             pinned_at: Set(None),
                             origin_cwd: Set(None),
                             last_error: Set(old_error),
-                            last_error_connection_id: Set(None),
+                            // Only a row still holding S1 can donate S1's
+                            // notification identity. If lifecycle already
+                            // rebound this row to S2, its live error belongs
+                            // to S2 and cannot identify a reconstructed S1 row.
+                            last_error_connection_id: Set(if current_is_forked {
+                                None
+                            } else {
+                                old_error_connection_id
+                            }),
                             last_error_scope_sequence: Set(old_error_scope_sequence),
                             last_error_revision: Set(old_error_revision),
                         };
@@ -7699,6 +7708,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fork_outcome_first_preserves_old_errors_live_notification_identity() {
+        use crate::acp::session_state::SessionLastError;
+        use crate::db::test_helpers;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder = test_helpers::seed_folder(&db, "/tmp/fork-error-notification").await;
+        let active = conversation_service::create(
+            &db.conn, folder, AgentType::Gemini, None, None,
+        )
+        .await
+        .unwrap();
+        conversation_service::bind_external_id(&db.conn, active.id, "S1", &[])
+            .await
+            .unwrap();
+        conversation_service::persist_last_error_for_agent_session(
+            &db.conn,
+            AgentType::Gemini,
+            "S1",
+            "S1-connection",
+            10,
+            Some(&SessionLastError {
+                message: "S1 failed".into(),
+                code: Some("process_exited".into()),
+                details: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let sibling = ConnectionManager::persist_fork_outcome(
+            &db.conn, active.id, "S2".into(), "S1".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, sibling)
+                .await
+                .unwrap()
+                .2
+                .as_deref(),
+            Some("S1-connection")
+        );
+        assert!(conversation_service::get_last_error(&db.conn, active.id)
+            .await
+            .unwrap()
+            .0
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn fork_session_adopts_a_sibling_the_lifecycle_subscriber_already_made() {
         // Fork's reply reaches us BEFORE `handle_fork_or_exit` emits
         // `SessionStarted{S2}`, so this persistence and the lifecycle worker
@@ -7858,6 +7916,21 @@ mod tests {
         .await
         .unwrap();
 
+        conversation_service::persist_last_error_for_agent_session(
+            &db.conn,
+            AgentType::Gemini,
+            "acp-uuid",
+            "S1-live",
+            9,
+            Some(&SessionLastError {
+                message: "old session failure".into(),
+                code: Some("process_exited".into()),
+                details: None,
+            }),
+        )
+        .await
+        .unwrap();
+
         // SessionStarted can reach the lifecycle worker before the fork
         // persistence task. It has already split S1 onto a preserving row.
         let preserved = conversation_service::bind_external_id(
@@ -7894,6 +7967,24 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(adopted, preserved);
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, preserved)
+                .await
+                .unwrap()
+                .2
+                .as_deref(),
+            Some("S1-live"),
+            "fork finalization must keep S1's live Alert identity"
+        );
+        assert_eq!(
+            conversation_service::get_last_error(&db.conn, active.id)
+                .await
+                .unwrap()
+                .2
+                .as_deref(),
+            Some("new-live"),
+            "S2 keeps its own error identity"
+        );
         assert_eq!(
             conversation_service::get_by_id(&db.conn, active.id)
                 .await
