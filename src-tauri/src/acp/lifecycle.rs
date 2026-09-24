@@ -2598,7 +2598,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        let (error, _) = conversation_service::get_last_error(&reopened, conv.id)
+        let (error, _, _) = conversation_service::get_last_error(&reopened, conv.id)
             .await
             .unwrap();
         assert_eq!(
@@ -3157,7 +3157,7 @@ mod tests {
         .unwrap();
         drop(tx);
         worker.await.unwrap();
-        let (error, revision) = conversation_service::get_last_error(&db.conn, conv.id)
+        let (error, revision, _) = conversation_service::get_last_error(&db.conn, conv.id)
             .await
             .unwrap();
         let error = error.unwrap();
@@ -3177,7 +3177,7 @@ mod tests {
         tx.send(work(5, prompt())).await.unwrap();
         drop(tx);
         worker.await.unwrap();
-        let (error, cleared_revision) = conversation_service::get_last_error(&db.conn, conv.id)
+        let (error, cleared_revision, _) = conversation_service::get_last_error(&db.conn, conv.id)
             .await
             .unwrap();
         assert!(error.is_none());

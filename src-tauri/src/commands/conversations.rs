@@ -1542,7 +1542,7 @@ pub async fn get_folder_conversation_core(
         .unwrap_or_default();
     inject_delegation_meta(&mut turns, &children);
 
-    let (last_error, last_error_revision) =
+    let (last_error, last_error_revision, last_error_connection_id) =
         conversation_service::get_last_error(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
@@ -1552,6 +1552,7 @@ pub async fn get_folder_conversation_core(
             summary,
             last_error,
             last_error_revision,
+            last_error_connection_id,
             turns,
             session_stats,
             transcript_watermark,
@@ -3762,7 +3763,12 @@ mod tests {
             })
         );
         assert!(detail.last_error_revision > 0);
+        assert_eq!(
+            detail.last_error_connection_id.as_deref(),
+            Some("failed-connection")
+        );
         let wire = serde_json::to_value(&detail).expect("serialize API response");
+        assert_eq!(wire["last_error_connection_id"], "failed-connection");
         assert_eq!(
             wire["last_error"]["message"],
             "agent failed while phone was offline"
@@ -6737,6 +6743,7 @@ mod tests {
             },
             last_error: None,
             last_error_revision: 0,
+            last_error_connection_id: None,
             turns,
             session_stats: None,
             transcript_watermark: Some(123),

@@ -1361,6 +1361,7 @@ mod tests {
             },
             last_error: None,
             last_error_revision: 0,
+            last_error_connection_id: None,
             turns,
             session_stats: stats,
             transcript_watermark: None,
