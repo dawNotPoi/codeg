@@ -388,8 +388,8 @@ export class RemoteDesktopTransport implements Transport {
       return
     }
     if (channel === WS_UNAUTHORIZED_CHANNEL) {
-      // Rust gave up after WS_RECONNECT_FAIL_THRESHOLD failures, OR the
-      // remote rejected the handshake. Either way, surface as expired.
+      // Rust received an explicit 401/403 WebSocket handshake rejection.
+      // Surface the remote authorization failure through the existing callback.
       this.config.onUnauthorized?.()
       return
     }

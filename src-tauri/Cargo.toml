@@ -42,7 +42,7 @@ tauri-runtime = [
 # `ConnectionManager::insert_test_connection`, parser `with_base_dir`, the
 # `db::test_helpers` module) for integration tests in `tests/*.rs`. Without
 # this feature the items are physically uncompiled in release builds.
-test-utils = []
+test-utils = ["tauri?/test"]
 # Built-in browser. `browser-child` compiles the embedded surface: a wry child
 # webview created directly through tauri-runtime-wry's re-exported `wry`
 # (`WebViewBuilder::build_as_child`), which is exactly how tauri-runtime-wry
